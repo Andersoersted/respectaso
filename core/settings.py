@@ -23,12 +23,22 @@ SECRET_KEY = os.environ.get(
 
 DEBUG = os.environ.get("DEBUG", "True").lower() in ("true", "1", "yes")
 
-ALLOWED_HOSTS = [
+DEFAULT_ALLOWED_HOSTS = [
     "localhost",
     "127.0.0.1",
     "0.0.0.0",
     "respectaso.private",
 ]
+
+
+def csv_env(name: str, default: list[str]) -> list[str]:
+    value = os.environ.get(name, "")
+    if not value.strip():
+        return default
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+ALLOWED_HOSTS = csv_env("ALLOWED_HOSTS", DEFAULT_ALLOWED_HOSTS)
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -90,8 +100,8 @@ STATIC_URL = "static/"
 STATICFILES_DIRS = [BASE_DIR / "static"]
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
-# CSRF trusted origins for local Docker access
-CSRF_TRUSTED_ORIGINS = [
+# CSRF trusted origins can be set from env (comma-separated).
+DEFAULT_CSRF_TRUSTED_ORIGINS = [
     "http://localhost",
     "http://127.0.0.1",
     "http://respectaso.private",
@@ -99,3 +109,7 @@ CSRF_TRUSTED_ORIGINS = [
     "http://127.0.0.1:9090",
     "http://respectaso.private:9090",
 ]
+CSRF_TRUSTED_ORIGINS = csv_env(
+    "CSRF_TRUSTED_ORIGINS",
+    DEFAULT_CSRF_TRUSTED_ORIGINS,
+)

@@ -8,6 +8,9 @@ services:
     restart: unless-stopped
     environment:
       - SECRET_KEY=${SECRET_KEY:-}
+      - DATA_DIR=/app/data
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-localhost,127.0.0.1,0.0.0.0,respectaso.private}
+      - CSRF_TRUSTED_ORIGINS=${CSRF_TRUSTED_ORIGINS:-http://localhost,http://127.0.0.1,http://respectaso.private}
 
 volumes:
   aso_data:

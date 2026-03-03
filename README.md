@@ -139,6 +139,19 @@ Then access the tool at **[http://respectaso.private](http://respectaso.private)
 
 The `.private` TLD is reserved by [RFC 6762](https://www.rfc-editor.org/rfc/rfc6762) and avoids conflicts with macOS mDNS resolution (unlike `.local`).
 
+### Custom Hosts / CSRF Origins (Cloudflare Tunnel)
+
+Set these env vars (comma-separated) in your `.env` file or shell before `docker compose up`:
+
+```bash
+ALLOWED_HOSTS=localhost,127.0.0.1,respectaso.private,aso.slusk.org
+CSRF_TRUSTED_ORIGINS=http://localhost,http://127.0.0.1,http://respectaso.private,https://aso.slusk.org
+```
+
+Notes:
+- `ALLOWED_HOSTS` must contain hostnames only (no scheme).
+- `CSRF_TRUSTED_ORIGINS` must contain full origins (with `http://` or `https://`).
+
 ### Data Persistence
 
 Your data is stored in a Docker volume (`aso_data`). Your database and secret key survive container restarts and rebuilds.
@@ -160,13 +173,19 @@ docker compose up -d
 
 Your data is preserved — only the application code is updated.
 
+To refresh dependency pins after changing `requirements.in`, run in a Python 3.14 environment:
+
+```bash
+pip-compile --upgrade requirements.in
+```
+
 ### Automatic Startup
 
 The `docker-compose.yml` includes `restart: unless-stopped`, so the tool automatically restarts when Docker starts. No need to run `docker compose up` again after a reboot.
 
 ## Tech Stack
 
-- **Python 3.12** + **Django 5.1**
+- **Python 3.14** + **Django 6.0**
 - **SQLite** — local single-user database
 - **Gunicorn** — production WSGI server
 - **WhiteNoise** — efficient static file serving
