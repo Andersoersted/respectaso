@@ -53,7 +53,7 @@ docker compose up -d
 
 ### 2. Open in your browser
 
-**→ [http://localhost](http://localhost)**
+**→ [http://localhost:8088](http://localhost:8088)**
 
 That's it. The first startup takes a few seconds (database migration + static files).
 
@@ -114,7 +114,7 @@ For more details, visit the **Methodology** page inside the app.
 
 ### Changing the Port
 
-The default `docker-compose.yml` maps port **80** on your host to port 8080 in the container. If port 80 is already in use:
+The default `docker-compose.yml` maps port **8088** on your host to port 8080 in the container. If port 8088 is already in use:
 
 ```yaml
 ports:
