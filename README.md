@@ -34,6 +34,9 @@ Most ASO tools require paid subscriptions, API keys, and send your keyword resea
 | **Multi-Country Search** | Search the same keyword across multiple countries simultaneously |
 | **App Rank Tracking** | Add your apps and see where you rank for each keyword alongside competitor data |
 | **Search History** | Browse past keyword research with sorting, filtering, and expandable detail views |
+| **Append-Only Trend History** | Every refresh can be stored as a new snapshot (including same-day runs) for richer trend analysis |
+| **Daily Auto Refresh (Cron)** | Refresh all tracked keyword-country pairs once per day via management command (recommended for Dokploy cron) |
+| **AI Keyword Suggestions (Apple-only)** | Generate app-specific keyword drafts using OpenAI + current market data + your historical results |
 | **CSV Export** | Export your keyword research data for use in spreadsheets |
 | **ASO Targeting Advice** | Automatic keyword classification (Sweet Spot, Hidden Gem, Low Volume, Avoid, etc.) based on popularity vs. difficulty |
 
@@ -152,6 +155,40 @@ Notes:
 - `ALLOWED_HOSTS` must contain hostnames only (no scheme).
 - `CSRF_TRUSTED_ORIGINS` must contain full origins (with `http://` or `https://`).
 
+### AI + Refresh Settings
+
+Set these in `.env` for AI suggestions and retention/scheduler behavior:
+
+```bash
+RESULT_RETENTION_DAYS=365
+AUTO_REFRESH_MODE=external
+
+OPENAI_API_KEY=your_key_here
+OPENAI_MODEL=gpt-4.1-mini
+OPENAI_TIMEOUT_SECONDS=40
+OPENAI_MAX_RETRIES=2
+AI_MAX_CANDIDATES=12
+AI_EVALUATED_CANDIDATES=8
+AI_MAX_COUNTRIES=3
+```
+
+`AUTO_REFRESH_MODE=external` is recommended in production (Dokploy/cron).
+`AUTO_REFRESH_MODE=thread` keeps the in-process hourly checker fallback.
+
+### Daily Cron Refresh (Recommended)
+
+Run once daily (example: 03:00 server time):
+
+```bash
+python manage.py refresh_tracked_keywords --trigger cron
+```
+
+Dokploy cron example:
+
+```cron
+0 3 * * * python manage.py refresh_tracked_keywords --trigger cron
+```
+
 ### Data Persistence
 
 Your data is stored in a Docker volume (`aso_data`). Your database and secret key survive container restarts and rebuilds.
@@ -189,6 +226,7 @@ The `docker-compose.yml` includes `restart: unless-stopped`, so the tool automat
 - **SQLite** — local single-user database
 - **Gunicorn** — production WSGI server
 - **WhiteNoise** — efficient static file serving
+- **OpenAI API (optional)** — AI keyword suggestion drafts
 - **Tailwind CSS** (CDN) — dark theme UI
 - **Docker** — single-command deployment
 

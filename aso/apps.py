@@ -10,7 +10,15 @@ class AsoConfig(AppConfig):
 
     def ready(self):
         # Don't start the scheduler during management commands
-        skip_commands = {"migrate", "makemigrations", "collectstatic", "createsuperuser", "shell"}
+        skip_commands = {
+            "migrate",
+            "makemigrations",
+            "collectstatic",
+            "createsuperuser",
+            "shell",
+            "refresh_tracked_keywords",
+            "test",
+        }
         if any(cmd in sys.argv for cmd in skip_commands):
             return
 

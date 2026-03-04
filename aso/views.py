@@ -12,7 +12,13 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
 from .forms import AppForm, KeywordSearchForm, OpportunitySearchForm, COUNTRY_CHOICES
-from .models import App, Keyword, SearchResult
+from .models import AISuggestion, AISuggestionRun, App, Keyword, RefreshRun, SearchResult
+from .ai_service import (
+    AISuggestionError,
+    accept_ai_suggestion,
+    generate_ai_suggestions,
+    reject_ai_suggestion,
+)
 from .services import (
     DifficultyCalculator,
     DownloadEstimator,
@@ -472,8 +478,7 @@ def opportunity_save_view(request):
 
     for item in selected:
         country = item.get("country", "us")
-        # One entry per keyword+country per day (preserves historical trend data)
-        SearchResult.upsert_today(
+        SearchResult.create_snapshot(
             keyword=keyword_obj,
             popularity_score=item.get("popularity", 0),
             difficulty_score=item.get("difficulty", 0),
@@ -481,6 +486,7 @@ def opportunity_save_view(request):
             competitors_data=item.get("competitors_data", []),
             app_rank=item.get("app_rank"),
             country=country,
+            source=SearchResult.SOURCE_OPPORTUNITY_SAVE,
         )
         saved += 1
 
@@ -692,8 +698,7 @@ def keyword_refresh_view(request, keyword_id):
     download_estimates = download_est.estimate(popularity or 0, len(competitors))
     breakdown["download_estimates"] = download_estimates
 
-    # Save new result (one entry per keyword+country per day)
-    search_result = SearchResult.upsert_today(
+    search_result = SearchResult.create_snapshot(
         keyword=keyword_obj,
         popularity_score=popularity,
         difficulty_score=difficulty_score,
@@ -701,6 +706,7 @@ def keyword_refresh_view(request, keyword_id):
         competitors_data=competitors,
         app_rank=app_rank,
         country=country,
+        source=SearchResult.SOURCE_MANUAL_REFRESH,
     )
 
     return JsonResponse({
@@ -813,7 +819,7 @@ def keywords_bulk_refresh_view(request):
         download_estimates = download_est.estimate(popularity or 0, len(competitors))
         breakdown["download_estimates"] = download_estimates
 
-        search_result = SearchResult.upsert_today(
+        search_result = SearchResult.create_snapshot(
             keyword=kw,
             popularity_score=popularity,
             difficulty_score=difficulty_score,
@@ -821,6 +827,7 @@ def keywords_bulk_refresh_view(request):
             competitors_data=competitors,
             app_rank=app_rank,
             country=country,
+            source=SearchResult.SOURCE_BULK_REFRESH,
         )
 
         results.append({
@@ -838,6 +845,161 @@ def keywords_bulk_refresh_view(request):
         })
 
     return JsonResponse({"success": True, "results": results, "refreshed": len(results)})
+
+
+def _serialize_ai_suggestion(s: AISuggestion):
+    metrics = s.market_metrics_json or {}
+    countries = metrics.get("countries", [])
+    return {
+        "id": s.id,
+        "app_id": s.app_id,
+        "run_id": s.run_id,
+        "keyword": s.keyword,
+        "intent": s.intent,
+        "rationale": s.rationale,
+        "confidence": s.confidence,
+        "score_market": s.score_market,
+        "score_history": s.score_history,
+        "score_overall": s.score_overall,
+        "status": s.status,
+        "created_keyword_id": s.created_keyword_id,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "resolved_at": s.resolved_at.isoformat() if s.resolved_at else None,
+        "countries": [
+            {
+                "country": item.get("country"),
+                "popularity": item.get("popularity"),
+                "difficulty": item.get("difficulty"),
+                "opportunity": item.get("opportunity"),
+                "app_rank": item.get("app_rank"),
+            }
+            for item in countries
+        ],
+    }
+
+
+def _ai_payload_for_app(app: App):
+    runs = list(
+        AISuggestionRun.objects.filter(app=app)
+        .order_by("-started_at")[:20]
+        .values("id", "status", "model", "countries_json", "started_at", "finished_at", "error")
+    )
+    suggestions_qs = AISuggestion.objects.filter(app=app).select_related("created_keyword", "run")
+    suggestions_qs = suggestions_qs.order_by("-created_at")[:200]
+    suggestions = [_serialize_ai_suggestion(s) for s in suggestions_qs]
+    return {
+        "app": {
+            "id": app.id,
+            "name": app.name,
+            "track_id": app.track_id,
+        },
+        "runs": [
+            {
+                "id": run["id"],
+                "status": run["status"],
+                "model": run["model"],
+                "countries": run["countries_json"],
+                "started_at": run["started_at"].isoformat() if run["started_at"] else None,
+                "finished_at": run["finished_at"].isoformat() if run["finished_at"] else None,
+                "error": run["error"],
+            }
+            for run in runs
+        ],
+        "suggestions": suggestions,
+    }
+
+
+def _get_app_by_id_param(app_id_raw):
+    try:
+        app_id = int(app_id_raw)
+    except (TypeError, ValueError):
+        return None
+    return App.objects.filter(id=app_id).first()
+
+
+def ai_suggestions_view(request):
+    app_id = request.GET.get("app_id")
+    if app_id:
+        app = _get_app_by_id_param(app_id)
+        if not app:
+            return JsonResponse({"error": "Valid app_id is required."}, status=400)
+        return JsonResponse(_ai_payload_for_app(app))
+
+    apps = App.objects.all()
+    selected_app = request.GET.get("app")
+    try:
+        selected_app_id = int(selected_app) if selected_app else None
+    except (TypeError, ValueError):
+        selected_app_id = None
+    return render(
+        request,
+        "aso/ai_suggestions.html",
+        {
+            "apps": apps,
+            "selected_app": selected_app_id,
+        },
+    )
+
+
+def ai_suggestions_list_view(request):
+    app_id = request.GET.get("app_id")
+    if not app_id:
+        return JsonResponse({"error": "app_id is required."}, status=400)
+    app = _get_app_by_id_param(app_id)
+    if not app:
+        return JsonResponse({"error": "Valid app_id is required."}, status=400)
+    return JsonResponse(_ai_payload_for_app(app))
+
+
+@require_POST
+def ai_suggestions_generate_view(request):
+    try:
+        body = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+    app_id = body.get("app_id")
+    if not app_id:
+        return JsonResponse({"error": "app_id is required."}, status=400)
+    app = get_object_or_404(App, id=app_id)
+
+    try:
+        run = generate_ai_suggestions(app)
+    except AISuggestionError as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    except Exception as exc:  # pragma: no cover - defensive runtime path
+        logger.exception("AI suggestion generation failed.")
+        return JsonResponse({"error": str(exc)}, status=500)
+
+    suggestions = [_serialize_ai_suggestion(s) for s in run.suggestions.order_by("-score_overall")]
+    return JsonResponse(
+        {
+            "success": True,
+            "run": {
+                "id": run.id,
+                "status": run.status,
+                "model": run.model,
+                "countries": run.countries_json,
+                "started_at": run.started_at.isoformat() if run.started_at else None,
+                "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+                "error": run.error,
+            },
+            "suggestions": suggestions,
+        }
+    )
+
+
+@require_POST
+def ai_suggestion_accept_view(request, suggestion_id):
+    suggestion = get_object_or_404(AISuggestion, id=suggestion_id)
+    suggestion = accept_ai_suggestion(suggestion)
+    return JsonResponse({"success": True, "suggestion": _serialize_ai_suggestion(suggestion)})
+
+
+@require_POST
+def ai_suggestion_reject_view(request, suggestion_id):
+    suggestion = get_object_or_404(AISuggestion, id=suggestion_id)
+    suggestion = reject_ai_suggestion(suggestion)
+    return JsonResponse({"success": True, "suggestion": _serialize_ai_suggestion(suggestion)})
 
 
 def version_check_view(request):
@@ -868,8 +1030,7 @@ def version_check_view(request):
 
 def auto_refresh_status_view(request):
     """Return the current auto-refresh progress as JSON."""
-    from .scheduler import get_status
-    return JsonResponse(get_status())
+    return JsonResponse(RefreshRun.latest_status_payload())
 
 
 def keyword_trend_view(request, keyword_id):
@@ -890,7 +1051,8 @@ def keyword_trend_view(request, keyword_id):
     for r in qs:
         data_points.append({
             "date": r.searched_at.strftime("%Y-%m-%d"),
-            "date_display": r.searched_at.strftime("%b %d"),
+            "datetime": r.searched_at.isoformat(),
+            "date_display": r.searched_at.strftime("%b %d, %H:%M"),
             "popularity": r.popularity_score,
             "difficulty": r.difficulty_score,
             "rank": r.app_rank,

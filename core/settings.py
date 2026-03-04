@@ -38,6 +38,38 @@ def csv_env(name: str, default: list[str]) -> list[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+def int_env(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    raw = os.environ.get(name)
+    try:
+        value = int(raw) if raw is not None and raw != "" else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def float_env(
+    name: str,
+    default: float,
+    *,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = float(raw) if raw is not None and raw != "" else float(default)
+    except (TypeError, ValueError):
+        value = float(default)
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
 ALLOWED_HOSTS = csv_env("ALLOWED_HOSTS", DEFAULT_ALLOWED_HOSTS)
 
 INSTALLED_APPS = [
@@ -113,3 +145,16 @@ CSRF_TRUSTED_ORIGINS = csv_env(
     "CSRF_TRUSTED_ORIGINS",
     DEFAULT_CSRF_TRUSTED_ORIGINS,
 )
+
+RESULT_RETENTION_DAYS = int_env("RESULT_RETENTION_DAYS", 365, min_value=30, max_value=3650)
+AUTO_REFRESH_MODE = os.environ.get("AUTO_REFRESH_MODE", "external").strip().lower()
+if AUTO_REFRESH_MODE not in {"external", "thread"}:
+    AUTO_REFRESH_MODE = "external"
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+OPENAI_TIMEOUT_SECONDS = float_env("OPENAI_TIMEOUT_SECONDS", 40.0, min_value=5.0, max_value=300.0)
+OPENAI_MAX_RETRIES = int_env("OPENAI_MAX_RETRIES", 2, min_value=0, max_value=10)
+AI_MAX_CANDIDATES = int_env("AI_MAX_CANDIDATES", 12, min_value=3, max_value=50)
+AI_EVALUATED_CANDIDATES = int_env("AI_EVALUATED_CANDIDATES", 8, min_value=1, max_value=30)
+AI_MAX_COUNTRIES = int_env("AI_MAX_COUNTRIES", 3, min_value=1, max_value=10)

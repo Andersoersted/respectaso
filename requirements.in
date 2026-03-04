@@ -1,5 +1,6 @@
 Django>=6.0,<6.1
 gunicorn
+openai==2.11.0
 python-dotenv
 requests
 whitenoise

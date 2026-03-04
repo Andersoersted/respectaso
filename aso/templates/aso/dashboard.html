@@ -61,6 +61,14 @@
                     </div>
                 </div>
             </div>
+            <div class="sm:w-44">
+                <label class="block text-xs font-medium text-slate-300 mb-1.5">AI</label>
+                <a id="ai-suggestions-link"
+                   href="{% url 'aso:ai_suggestions' %}{% if selected_app %}?app={{ selected_app }}{% endif %}"
+                   class="w-full inline-flex items-center justify-center bg-purple-600/20 border border-purple-500/30 text-purple-300 hover:bg-purple-600/30 rounded-lg px-3 py-2.5 text-sm transition-colors">
+                    AI Suggestions
+                </a>
+            </div>
         </div>
     </div>
 
@@ -1405,6 +1413,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const loadingText = document.getElementById('loading-text');
     const searchBtn = document.getElementById('search-btn');
     const globalApp = document.getElementById('global-app');
+    const aiSuggestionsLink = document.getElementById('ai-suggestions-link');
 
     // App filter: reload page with ?app= param to filter history
     // Restore app selection from localStorage if no ?app= param
@@ -1417,6 +1426,12 @@ document.addEventListener('DOMContentLoaded', function() {
             window.location.href = `?app=${savedApp}`;
             return;
         }
+    }
+    if (aiSuggestionsLink) {
+        const selectedApp = globalApp.value;
+        aiSuggestionsLink.href = selectedApp
+            ? `{% url 'aso:ai_suggestions' %}?app=${encodeURIComponent(selectedApp)}`
+            : `{% url 'aso:ai_suggestions' %}`;
     }
     globalApp.addEventListener('change', function() {
         const appId = this.value;
@@ -1433,6 +1448,11 @@ document.addEventListener('DOMContentLoaded', function() {
         const currentCountry = urlParams.get('country');
         if (currentCountry) params.set('country', currentCountry);
         const qs = params.toString();
+        if (aiSuggestionsLink) {
+            aiSuggestionsLink.href = appId
+                ? `{% url 'aso:ai_suggestions' %}?app=${encodeURIComponent(appId)}`
+                : `{% url 'aso:ai_suggestions' %}`;
+        }
         window.location.href = qs ? `?${qs}` : '{% url "aso:dashboard" %}';
     });
 
@@ -2035,7 +2055,7 @@ function renderTrendPanel(data, keywordId, country) {
     // Build SVG line chart — generous sizing for readability
     const W = 720, H = 280, PAD_L = 55, PAD_T = 25, PAD_B = 50;
     // Extract series first to decide if we need right axis
-    const dates = points.map(p => p.date);
+    const datetimes = points.map(p => p.datetime || p.date);
     const popularity = points.map(p => p.popularity);
     const difficulty = points.map(p => p.difficulty);
     const ranks = points.map(p => p.rank);
@@ -2141,18 +2161,19 @@ function renderTrendPanel(data, keywordId, country) {
     // X-axis labels — show every date if ≤ 10, otherwise pick smart ticks
     const maxXLabels = 10;
     let xIndices;
-    if (dates.length <= maxXLabels) {
-        xIndices = dates.map((_, i) => i);
+    if (datetimes.length <= maxXLabels) {
+        xIndices = datetimes.map((_, i) => i);
     } else {
-        const step = Math.ceil(dates.length / maxXLabels);
+        const step = Math.ceil(datetimes.length / maxXLabels);
         xIndices = [];
-        for (let i = 0; i < dates.length; i += step) xIndices.push(i);
-        if (xIndices[xIndices.length - 1] !== dates.length - 1) xIndices.push(dates.length - 1);
+        for (let i = 0; i < datetimes.length; i += step) xIndices.push(i);
+        if (xIndices[xIndices.length - 1] !== datetimes.length - 1) xIndices.push(datetimes.length - 1);
     }
     const xLabels = xIndices.map(i => {
-        const x = PAD_L + (i / (dates.length - 1)) * chartW;
-        const d = new Date(dates[i]);
-        const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        const x = PAD_L + (i / (datetimes.length - 1)) * chartW;
+        const d = new Date(datetimes[i]);
+        const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' ' +
+            d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
         return `
             <line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}" y1="${PAD_T}" y2="${PAD_T + chartH}" stroke="rgba(255,255,255,0.04)"/>
             <text x="${x.toFixed(1)}" y="${H - PAD_B + 20}" fill="rgba(148,163,184,0.7)" text-anchor="middle" font-size="13" font-family="system-ui">${label}</text>`;
@@ -2172,8 +2193,9 @@ function renderTrendPanel(data, keywordId, country) {
     // History table
     let historyRows = '';
     points.forEach(p => {
-        const d = new Date(p.date);
-        const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        const d = new Date(p.datetime || p.date);
+        const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) + ' ' +
+            d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
         historyRows += `
             <tr class="border-b border-white/5 hover:bg-white/[0.02]">
                 <td class="px-3 py-1.5 text-slate-400 text-xs">${dateStr}</td>

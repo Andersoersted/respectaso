@@ -6,6 +6,11 @@ app_name = "aso"
 
 urlpatterns = [
     path("", views.dashboard_view, name="dashboard"),
+    path("ai/suggestions/", views.ai_suggestions_view, name="ai_suggestions"),
+    path("ai/suggestions/list/", views.ai_suggestions_list_view, name="ai_suggestions_list"),
+    path("ai/suggestions/generate/", views.ai_suggestions_generate_view, name="ai_suggestions_generate"),
+    path("ai/suggestions/<int:suggestion_id>/accept/", views.ai_suggestion_accept_view, name="ai_suggestion_accept"),
+    path("ai/suggestions/<int:suggestion_id>/reject/", views.ai_suggestion_reject_view, name="ai_suggestion_reject"),
     path("methodology/", views.methodology_view, name="methodology"),
     path("setup/", views.setup_view, name="setup"),
     path("search/", views.search_view, name="search"),

@@ -1,0 +1,239 @@
+{% extends "aso/base.html" %}
+
+{% block title %}AI Suggestions — RespectASO{% endblock %}
+
+{% block content %}
+<div class="max-w-6xl mx-auto space-y-5">
+    <form class="hidden">{% csrf_token %}</form>
+    <div>
+        <h1 class="text-xl font-bold text-white">AI Keyword Suggestions</h1>
+        <p class="text-slate-400 text-sm mt-0.5">
+            Apple App Store only. Generate draft keywords based on app metadata, current market, and your historical trends.
+        </p>
+    </div>
+
+    <div class="bg-[#1e293b] border border-white/10 rounded-xl p-4">
+        <div class="flex flex-col sm:flex-row gap-3 sm:items-end">
+            <div class="flex-1">
+                <label for="ai-app-select" class="block text-xs font-medium text-slate-300 mb-1.5">App</label>
+                <select id="ai-app-select" class="w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500">
+                    <option value="">Select an app…</option>
+                    {% for app in apps %}
+                    <option value="{{ app.id }}" {% if selected_app == app.id %}selected{% endif %}>{{ app.name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <button id="ai-generate-btn"
+                    class="bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium px-4 py-2.5 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled>
+                Generate Suggestions
+            </button>
+        </div>
+        <p class="text-xs text-slate-500 mt-2">The selected app must be linked from App Store lookup (track_id required).</p>
+    </div>
+
+    <div id="ai-run-status" class="hidden bg-slate-800/50 border border-white/10 rounded-xl p-3 text-sm"></div>
+
+    <div class="bg-[#1e293b] border border-white/10 rounded-xl overflow-hidden">
+        <div class="px-4 py-3 border-b border-white/10">
+            <h2 class="text-base font-semibold text-white">Draft Suggestions</h2>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full">
+                <thead>
+                    <tr class="border-b border-white/10">
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Keyword</th>
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Intent</th>
+                        <th class="px-3 py-2 text-center text-xs font-medium text-slate-400">Overall</th>
+                        <th class="px-3 py-2 text-center text-xs font-medium text-slate-400">Market</th>
+                        <th class="px-3 py-2 text-center text-xs font-medium text-slate-400">Confidence</th>
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Countries</th>
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Rationale</th>
+                        <th class="px-3 py-2 text-right text-xs font-medium text-slate-400">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="ai-suggestions-body">
+                    <tr><td colspan="8" class="px-3 py-5 text-sm text-slate-500 text-center">Select an app to load suggestions.</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="bg-[#1e293b] border border-white/10 rounded-xl overflow-hidden">
+        <div class="px-4 py-3 border-b border-white/10">
+            <h2 class="text-base font-semibold text-white">Recent Runs</h2>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full">
+                <thead>
+                    <tr class="border-b border-white/10">
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Run</th>
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Status</th>
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Model</th>
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Countries</th>
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Started</th>
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Error</th>
+                    </tr>
+                </thead>
+                <tbody id="ai-runs-body">
+                    <tr><td colspan="6" class="px-3 py-5 text-sm text-slate-500 text-center">No runs yet.</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    const appSelect = document.getElementById('ai-app-select');
+    const generateBtn = document.getElementById('ai-generate-btn');
+    const suggestionsBody = document.getElementById('ai-suggestions-body');
+    const runsBody = document.getElementById('ai-runs-body');
+    const runStatus = document.getElementById('ai-run-status');
+    const csrf = document.querySelector('[name=csrfmiddlewaretoken]')?.value || '';
+
+    function setStatus(msg, type='info') {
+        runStatus.classList.remove('hidden');
+        runStatus.className = 'bg-slate-800/50 border border-white/10 rounded-xl p-3 text-sm';
+        if (type === 'error') runStatus.classList.add('text-red-300', 'border-red-500/30', 'bg-red-900/20');
+        else if (type === 'success') runStatus.classList.add('text-green-300', 'border-green-500/30', 'bg-green-900/20');
+        else runStatus.classList.add('text-slate-300');
+        runStatus.textContent = msg;
+    }
+
+    function fmtPct(x) {
+        return Math.round((Number(x || 0) * 100)) + '%';
+    }
+
+    function renderSuggestions(suggestions) {
+        if (!suggestions || suggestions.length === 0) {
+            suggestionsBody.innerHTML = '<tr><td colspan="8" class="px-3 py-5 text-sm text-slate-500 text-center">No suggestions yet.</td></tr>';
+            return;
+        }
+        suggestionsBody.innerHTML = suggestions.map((s) => {
+            const countries = (s.countries || []).map((c) =>
+                `${String(c.country || '').toUpperCase()}: P${c.popularity ?? '—'} / D${c.difficulty ?? '—'} / O${c.opportunity ?? '—'}`
+            ).join('<br>');
+            const statusChip = s.status === 'accepted'
+                ? '<span class="text-green-300">Accepted</span>'
+                : s.status === 'rejected'
+                    ? '<span class="text-red-300">Rejected</span>'
+                    : '<span class="text-yellow-300">Draft</span>';
+            return `
+                <tr class="border-b border-white/5 align-top">
+                    <td class="px-3 py-2 text-sm text-white font-medium">${s.keyword}</td>
+                    <td class="px-3 py-2 text-xs text-slate-300">${s.intent || '—'}</td>
+                    <td class="px-3 py-2 text-xs text-center text-purple-300">${fmtPct(s.score_overall)}</td>
+                    <td class="px-3 py-2 text-xs text-center text-sky-300">${fmtPct(s.score_market)}</td>
+                    <td class="px-3 py-2 text-xs text-center text-emerald-300">${fmtPct(s.confidence)}</td>
+                    <td class="px-3 py-2 text-[11px] text-slate-300 whitespace-nowrap">${countries || '—'}</td>
+                    <td class="px-3 py-2 text-xs text-slate-300 max-w-md">${s.rationale || '—'}</td>
+                    <td class="px-3 py-2 text-right text-xs">
+                        <div class="space-y-1">
+                            <div>${statusChip}</div>
+                            ${s.status === 'draft' ? `
+                            <button data-action="accept" data-id="${s.id}" class="ai-action bg-green-600/20 hover:bg-green-600/30 text-green-300 px-2 py-1 rounded mr-1">Accept</button>
+                            <button data-action="reject" data-id="${s.id}" class="ai-action bg-red-600/20 hover:bg-red-600/30 text-red-300 px-2 py-1 rounded">Reject</button>
+                            ` : ''}
+                        </div>
+                    </td>
+                </tr>`;
+        }).join('');
+    }
+
+    function renderRuns(runs) {
+        if (!runs || runs.length === 0) {
+            runsBody.innerHTML = '<tr><td colspan="6" class="px-3 py-5 text-sm text-slate-500 text-center">No runs yet.</td></tr>';
+            return;
+        }
+        runsBody.innerHTML = runs.map((run) => `
+            <tr class="border-b border-white/5">
+                <td class="px-3 py-2 text-xs text-slate-300">#${run.id}</td>
+                <td class="px-3 py-2 text-xs text-slate-300">${run.status}</td>
+                <td class="px-3 py-2 text-xs text-slate-300">${run.model}</td>
+                <td class="px-3 py-2 text-xs text-slate-300">${(run.countries || []).map(c => String(c).toUpperCase()).join(', ') || '—'}</td>
+                <td class="px-3 py-2 text-xs text-slate-300">${run.started_at ? new Date(run.started_at).toLocaleString() : '—'}</td>
+                <td class="px-3 py-2 text-xs text-red-300">${run.error || '—'}</td>
+            </tr>
+        `).join('');
+    }
+
+    async function loadSuggestions() {
+        const appId = appSelect.value;
+        generateBtn.disabled = !appId;
+        if (!appId) {
+            renderSuggestions([]);
+            renderRuns([]);
+            return;
+        }
+        try {
+            const resp = await fetch(`{% url "aso:ai_suggestions" %}?app_id=${encodeURIComponent(appId)}`);
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || 'Failed to load suggestions.');
+            renderSuggestions(data.suggestions || []);
+            renderRuns(data.runs || []);
+            setStatus(`Loaded AI data for ${data.app.name}.`, 'info');
+        } catch (err) {
+            setStatus(err.message || 'Failed to load AI data.', 'error');
+        }
+    }
+
+    async function generateSuggestions() {
+        const appId = appSelect.value;
+        if (!appId) return;
+        generateBtn.disabled = true;
+        setStatus('Generating suggestions… This can take a while due to market analysis.', 'info');
+        try {
+            const resp = await fetch('{% url "aso:ai_suggestions_generate" %}', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf},
+                body: JSON.stringify({app_id: Number(appId)}),
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || 'Generation failed.');
+            setStatus(`Generated ${data.suggestions.length} draft suggestions.`, 'success');
+            renderSuggestions(data.suggestions || []);
+            await loadSuggestions();
+        } catch (err) {
+            setStatus(err.message || 'Generation failed.', 'error');
+        } finally {
+            generateBtn.disabled = !appSelect.value;
+        }
+    }
+
+    async function updateSuggestion(action, suggestionId) {
+        const url = action === 'accept'
+            ? `{% url "aso:ai_suggestion_accept" 0 %}`.replace('/0/', `/${suggestionId}/`)
+            : `{% url "aso:ai_suggestion_reject" 0 %}`.replace('/0/', `/${suggestionId}/`);
+        try {
+            const resp = await fetch(url, {
+                method: 'POST',
+                headers: {'X-CSRFToken': csrf},
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || 'Action failed.');
+            setStatus(`Suggestion "${data.suggestion.keyword}" marked as ${data.suggestion.status}.`, 'success');
+            await loadSuggestions();
+        } catch (err) {
+            setStatus(err.message || 'Failed to update suggestion.', 'error');
+        }
+    }
+
+    appSelect.addEventListener('change', () => {
+        const appId = appSelect.value;
+        const nextUrl = appId ? `?app=${encodeURIComponent(appId)}` : window.location.pathname;
+        history.replaceState(null, '', nextUrl);
+        loadSuggestions();
+    });
+    generateBtn.addEventListener('click', generateSuggestions);
+
+    suggestionsBody.addEventListener('click', (e) => {
+        const btn = e.target.closest('.ai-action');
+        if (!btn) return;
+        updateSuggestion(btn.dataset.action, btn.dataset.id);
+    });
+
+    loadSuggestions();
+});
+</script>
+{% endblock %}

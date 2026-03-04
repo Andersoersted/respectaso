@@ -55,6 +55,10 @@
                        class="text-sm {% if request.resolver_match.url_name == 'opportunity' %}text-purple-400 font-medium{% else %}text-slate-300 hover:text-white{% endif %} transition-colors">
                         Opportunity
                     </a>
+                    <a href="{% url 'aso:ai_suggestions' %}"
+                       class="text-sm {% if request.resolver_match.url_name == 'ai_suggestions' %}text-purple-400 font-medium{% else %}text-slate-300 hover:text-white{% endif %} transition-colors">
+                        AI Suggestions
+                    </a>
                     <a href="{% url 'aso:methodology' %}"
                        class="text-sm {% if request.resolver_match.url_name == 'methodology' %}text-purple-400 font-medium{% else %}text-slate-300 hover:text-white{% endif %} transition-colors">
                         Methodology
