@@ -7,12 +7,13 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import timedelta
 
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
+import requests
 
 from .models import AISuggestion, AISuggestionRun, App, Keyword, SearchResult
 from .services import (
@@ -104,7 +105,84 @@ def _build_history_summary(app: App) -> tuple[list[dict], list[str]]:
     return scored[:30], historical_keyword_list
 
 
-def _build_input_snapshot(app: App, countries: list[str]) -> dict:
+def _build_recent_history_rows(app: App, history_rows_max: int) -> list[dict]:
+    rows = (
+        SearchResult.objects.filter(keyword__app=app)
+        .select_related("keyword")
+        .order_by("-searched_at")[:history_rows_max]
+    )
+    data = []
+    for row in rows:
+        data.append(
+            {
+                "keyword": row.keyword.keyword,
+                "country": row.country,
+                "popularity": row.popularity_score,
+                "difficulty": row.difficulty_score,
+                "app_rank": row.app_rank,
+                "source": row.source,
+                "searched_at": row.searched_at.isoformat() if row.searched_at else None,
+            }
+        )
+    return data
+
+
+def _fetch_online_market_context(countries: list[str], top_apps_per_country: int) -> dict:
+    """
+    Fetch lightweight online context from Apple top charts (no API key needed).
+    """
+    result = {"sources": [], "countries": {}}
+    top_apps_per_country = max(5, min(50, int(top_apps_per_country)))
+    for country in countries:
+        url = (
+            f"https://rss.applemarketingtools.com/api/v2/"
+            f"{country}/apps/top-free/{top_apps_per_country}/apps.json"
+        )
+        try:
+            response = requests.get(url, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            logger.warning("Online market context fetch failed for %s: %s", country, exc)
+            continue
+
+        feed_results = payload.get("feed", {}).get("results", [])[:top_apps_per_country]
+        top_apps = []
+        token_counts: Counter[str] = Counter()
+        for item in feed_results:
+            name = str(item.get("name", "")).strip()
+            artist_name = str(item.get("artistName", "")).strip()
+            genres = item.get("genres") or []
+            genre_names = [g.get("name", "") for g in genres if isinstance(g, dict)]
+            for token in WORD_RE.findall(name.lower()):
+                if len(token) >= 3:
+                    token_counts[token] += 1
+            top_apps.append(
+                {
+                    "name": name,
+                    "artist_name": artist_name,
+                    "genres": [g for g in genre_names if g][:3],
+                }
+            )
+
+        result["countries"][country] = {
+            "top_apps": top_apps[: min(15, len(top_apps))],
+            "top_terms": [
+                {"term": term, "count": count}
+                for term, count in token_counts.most_common(20)
+            ],
+        }
+        result["sources"].append(url)
+    return result
+
+
+def _build_input_snapshot(
+    app: App,
+    countries: list[str],
+    *,
+    history_rows_max: int,
+    online_context: dict | None = None,
+) -> dict:
     itunes_service = ITunesSearchService()
     app_lookup = itunes_service.lookup_by_id(app.track_id, country=countries[0]) if app.track_id else None
 
@@ -112,6 +190,8 @@ def _build_input_snapshot(app: App, countries: list[str]) -> dict:
         Keyword.objects.filter(app=app).values_list("keyword", flat=True).order_by("-created_at")
     )
     history_rows, historical_keyword_list = _build_history_summary(app)
+    recent_history_rows = _build_recent_history_rows(app, history_rows_max)
+    total_history_rows = SearchResult.objects.filter(keyword__app=app).count()
 
     snapshot = {
         "app": {
@@ -124,7 +204,11 @@ def _build_input_snapshot(app: App, countries: list[str]) -> dict:
         "countries": countries,
         "existing_keywords": existing_keywords[:100],
         "history_top_rows": history_rows,
+        "history_recent_rows": recent_history_rows,
+        "history_total_rows": total_history_rows,
     }
+    if online_context is not None:
+        snapshot["online_market_context"] = online_context
     return snapshot | {"history_keywords": historical_keyword_list}
 
 
@@ -158,16 +242,29 @@ def _json_schema():
     }
 
 
-def _generate_candidates(snapshot: dict, model: str, api_key: str) -> list[dict]:
+def _render_user_prompt(template: str, snapshot: dict, online_context: dict) -> str:
+    snapshot_json = json.dumps(snapshot, ensure_ascii=True)
+    online_json = json.dumps(online_context, ensure_ascii=True)
+    prompt = (template or "").replace("{{SNAPSHOT_JSON}}", snapshot_json)
+    prompt = prompt.replace("{{ONLINE_CONTEXT_JSON}}", online_json)
+    if "{{SNAPSHOT_JSON}}" not in (template or ""):
+        prompt += f"\n\nAPP + HISTORICAL DATA JSON:\n{snapshot_json}"
+    if "{{ONLINE_CONTEXT_JSON}}" not in (template or ""):
+        prompt += f"\n\nONLINE MARKET CONTEXT JSON:\n{online_json}"
+    return prompt
+
+
+def _generate_candidates(
+    snapshot: dict,
+    *,
+    model: str,
+    api_key: str,
+    system_prompt: str,
+    user_prompt_template: str,
+    online_context: dict,
+) -> list[dict]:
     client = _build_openai_client(api_key)
-    prompt = (
-        "You are an App Store Optimization analyst for Apple App Store only.\n"
-        "Generate candidate keywords for this exact app.\n"
-        "Prioritize: intent relevance, realistic competition, and discoverability.\n"
-        "Avoid generic junk or duplicate phrases.\n"
-        "Input data JSON:\n"
-        f"{json.dumps(snapshot, ensure_ascii=True)}"
-    )
+    prompt = _render_user_prompt(user_prompt_template, snapshot, online_context)
 
     response = client.chat.completions.create(
         model=model,
@@ -175,10 +272,7 @@ def _generate_candidates(snapshot: dict, model: str, api_key: str) -> list[dict]
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "Return JSON that exactly matches the schema. "
-                    "Focus on Apple App Store keyword recommendations."
-                ),
+                "content": system_prompt,
             },
             {"role": "user", "content": prompt},
         ],
@@ -301,6 +395,11 @@ def generate_ai_suggestions(
     *,
     model: str | None = None,
     api_key: str | None = None,
+    system_prompt: str | None = None,
+    user_prompt_template: str | None = None,
+    enable_online_context: bool | None = None,
+    online_top_apps_per_country: int | None = None,
+    history_rows_max: int | None = None,
 ) -> AISuggestionRun:
     if not app.track_id:
         raise AISuggestionError("This app must be linked via App Store lookup (track_id) before AI suggestions.")
@@ -308,9 +407,33 @@ def generate_ai_suggestions(
     if not chosen_model:
         raise AISuggestionError("No AI model selected.")
     chosen_api_key = (api_key or settings.OPENAI_API_KEY).strip()
+    chosen_system_prompt = (system_prompt or settings.AI_SYSTEM_PROMPT).strip()
+    chosen_user_prompt_template = (
+        (user_prompt_template or settings.AI_USER_PROMPT_TEMPLATE).strip()
+    )
+    chosen_enable_online_context = (
+        settings.AI_ENABLE_ONLINE_CONTEXT if enable_online_context is None else bool(enable_online_context)
+    )
+    chosen_online_top_apps = int(
+        online_top_apps_per_country
+        if online_top_apps_per_country is not None
+        else settings.AI_ONLINE_TOP_APPS_PER_COUNTRY
+    )
+    chosen_history_rows_max = int(
+        history_rows_max if history_rows_max is not None else settings.AI_HISTORY_ROWS_MAX
+    )
+    chosen_history_rows_max = max(50, min(5000, chosen_history_rows_max))
 
     countries = _choose_countries(app)
-    snapshot = _build_input_snapshot(app, countries)
+    online_context = {}
+    if chosen_enable_online_context:
+        online_context = _fetch_online_market_context(countries, chosen_online_top_apps)
+    snapshot = _build_input_snapshot(
+        app,
+        countries,
+        history_rows_max=chosen_history_rows_max,
+        online_context=online_context,
+    )
 
     run = AISuggestionRun.objects.create(
         app=app,
@@ -321,7 +444,14 @@ def generate_ai_suggestions(
     )
 
     try:
-        raw_candidates = _generate_candidates(snapshot, chosen_model, chosen_api_key)
+        raw_candidates = _generate_candidates(
+            snapshot,
+            model=chosen_model,
+            api_key=chosen_api_key,
+            system_prompt=chosen_system_prompt,
+            user_prompt_template=chosen_user_prompt_template,
+            online_context=online_context,
+        )
         existing_keywords = {
             _clean_candidate_keyword(value)
             for value in Keyword.objects.filter(app=app).values_list("keyword", flat=True)

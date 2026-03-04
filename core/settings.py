@@ -70,6 +70,13 @@ def float_env(
     return value
 
 
+def bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return bool(default)
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 ALLOWED_HOSTS = csv_env("ALLOWED_HOSTS", DEFAULT_ALLOWED_HOSTS)
 
 INSTALLED_APPS = [
@@ -165,3 +172,31 @@ OPENAI_MAX_RETRIES = int_env("OPENAI_MAX_RETRIES", 2, min_value=0, max_value=10)
 AI_MAX_CANDIDATES = int_env("AI_MAX_CANDIDATES", 12, min_value=3, max_value=50)
 AI_EVALUATED_CANDIDATES = int_env("AI_EVALUATED_CANDIDATES", 8, min_value=1, max_value=30)
 AI_MAX_COUNTRIES = int_env("AI_MAX_COUNTRIES", 3, min_value=1, max_value=10)
+AI_HISTORY_ROWS_MAX = int_env("AI_HISTORY_ROWS_MAX", 300, min_value=50, max_value=5000)
+AI_ENABLE_ONLINE_CONTEXT = bool_env("AI_ENABLE_ONLINE_CONTEXT", True)
+AI_ONLINE_TOP_APPS_PER_COUNTRY = int_env(
+    "AI_ONLINE_TOP_APPS_PER_COUNTRY",
+    20,
+    min_value=5,
+    max_value=50,
+)
+DEFAULT_AI_SYSTEM_PROMPT = (
+    "You are an App Store Optimization analyst for Apple App Store only. "
+    "Use the provided app metadata, tracked keyword history, and market context to generate practical keyword ideas. "
+    "Focus on intent relevance, realistic competition, and discoverability. "
+    "Avoid duplicates, vague buzzwords, or off-topic suggestions."
+)
+AI_SYSTEM_PROMPT = os.environ.get("AI_SYSTEM_PROMPT", DEFAULT_AI_SYSTEM_PROMPT).strip() or DEFAULT_AI_SYSTEM_PROMPT
+DEFAULT_AI_USER_PROMPT_TEMPLATE = (
+    "Task: propose high-quality Apple App Store keyword candidates for this app.\n"
+    "You must use all available context below.\n\n"
+    "APP + HISTORICAL DATA JSON:\n"
+    "{{SNAPSHOT_JSON}}\n\n"
+    "ONLINE MARKET CONTEXT JSON:\n"
+    "{{ONLINE_CONTEXT_JSON}}\n\n"
+    "Return only valid JSON matching the provided schema."
+)
+AI_USER_PROMPT_TEMPLATE = (
+    os.environ.get("AI_USER_PROMPT_TEMPLATE", DEFAULT_AI_USER_PROMPT_TEMPLATE).strip()
+    or DEFAULT_AI_USER_PROMPT_TEMPLATE
+)

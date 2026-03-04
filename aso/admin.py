@@ -56,5 +56,10 @@ class AISuggestionAdmin(admin.ModelAdmin):
 
 @admin.register(RuntimeConfig)
 class RuntimeConfigAdmin(admin.ModelAdmin):
-    list_display = ("singleton_key", "openai_default_model", "updated_at")
+    list_display = (
+        "singleton_key",
+        "openai_default_model",
+        "ai_enable_online_context",
+        "updated_at",
+    )
     readonly_fields = ("singleton_key", "updated_at")

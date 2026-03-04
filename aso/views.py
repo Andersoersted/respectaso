@@ -67,6 +67,9 @@ def config_view(request):
             "api_key_source": effective["api_key_source"],
             "effective_default_model": effective["default_model"],
             "effective_available_models": effective["available_models"],
+            "effective_online_context_enabled": effective["enable_online_context"],
+            "effective_online_top_apps_per_country": effective["online_top_apps_per_country"],
+            "effective_history_rows_max": effective["history_rows_max"],
         },
     )
 
@@ -966,6 +969,24 @@ def _effective_ai_settings() -> dict:
         available_models.insert(0, default_model)
     if not available_models and default_model:
         available_models = [default_model]
+    system_prompt = runtime.ai_system_prompt.strip() or settings.AI_SYSTEM_PROMPT
+    user_prompt_template = runtime.ai_user_prompt_template.strip() or settings.AI_USER_PROMPT_TEMPLATE
+    if runtime.ai_enable_online_context is None:
+        enable_online_context = settings.AI_ENABLE_ONLINE_CONTEXT
+    else:
+        enable_online_context = bool(runtime.ai_enable_online_context)
+    online_top_apps_per_country = (
+        runtime.ai_online_top_apps_per_country
+        if runtime.ai_online_top_apps_per_country
+        else settings.AI_ONLINE_TOP_APPS_PER_COUNTRY
+    )
+    online_top_apps_per_country = max(5, min(50, int(online_top_apps_per_country)))
+    history_rows_max = (
+        runtime.ai_history_rows_max
+        if runtime.ai_history_rows_max
+        else settings.AI_HISTORY_ROWS_MAX
+    )
+    history_rows_max = max(50, min(5000, int(history_rows_max)))
 
     api_key_source = "none"
     if runtime.openai_api_key.strip():
@@ -978,6 +999,11 @@ def _effective_ai_settings() -> dict:
         "default_model": default_model,
         "available_models": available_models,
         "api_key_source": api_key_source,
+        "system_prompt": system_prompt,
+        "user_prompt_template": user_prompt_template,
+        "enable_online_context": enable_online_context,
+        "online_top_apps_per_country": online_top_apps_per_country,
+        "history_rows_max": history_rows_max,
     }
 
 
@@ -1054,6 +1080,11 @@ def ai_suggestions_generate_view(request):
             app,
             model=selected_model,
             api_key=effective["api_key"],
+            system_prompt=effective["system_prompt"],
+            user_prompt_template=effective["user_prompt_template"],
+            enable_online_context=effective["enable_online_context"],
+            online_top_apps_per_country=effective["online_top_apps_per_country"],
+            history_rows_max=effective["history_rows_max"],
         )
     except AISuggestionError as exc:
         return JsonResponse({"error": str(exc)}, status=400)

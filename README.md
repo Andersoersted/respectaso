@@ -171,11 +171,15 @@ OPENAI_MAX_RETRIES=2
 AI_MAX_CANDIDATES=12
 AI_EVALUATED_CANDIDATES=8
 AI_MAX_COUNTRIES=3
+AI_HISTORY_ROWS_MAX=300
+AI_ENABLE_ONLINE_CONTEXT=true
+AI_ONLINE_TOP_APPS_PER_COUNTRY=20
 ```
 
 `AUTO_REFRESH_MODE=external` is recommended in production (Dokploy/cron).
 `AUTO_REFRESH_MODE=thread` keeps the in-process hourly checker fallback.
-You can also manage OpenAI key/model settings in-app at `/config/` (stored in SQLite under `/app/data`).
+You can also manage OpenAI key/model settings, prompt templates, and online context controls in-app at `/config/` (stored in SQLite under `/app/data`).
+Prompt template placeholders: `{{SNAPSHOT_JSON}}` and `{{ONLINE_CONTEXT_JSON}}`.
 
 ### Daily Cron Refresh (Recommended)
 

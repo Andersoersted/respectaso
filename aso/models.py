@@ -426,6 +426,24 @@ class RuntimeConfig(models.Model):
         default="",
         help_text="Comma-separated list of models shown in the AI Suggestions dropdown.",
     )
+    ai_system_prompt = models.TextField(blank=True, default="")
+    ai_user_prompt_template = models.TextField(blank=True, default="")
+    ai_enable_online_context = models.BooleanField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text="Enable online market enrichment for AI suggestions.",
+    )
+    ai_online_top_apps_per_country = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Top free apps fetched per country when online context is enabled (5-50).",
+    )
+    ai_history_rows_max = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Maximum number of historical snapshots passed to AI context.",
+    )
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:

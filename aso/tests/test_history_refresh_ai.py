@@ -254,7 +254,16 @@ class AISuggestionEndpointTests(TestCase):
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 200)
-        mock_generate.assert_called_once_with(self.app, model="gpt-4.1-mini", api_key=ANY)
+        mock_generate.assert_called_once_with(
+            self.app,
+            model="gpt-4.1-mini",
+            api_key=ANY,
+            system_prompt=ANY,
+            user_prompt_template=ANY,
+            enable_online_context=ANY,
+            online_top_apps_per_country=ANY,
+            history_rows_max=ANY,
+        )
         payload = response.json()
         self.assertTrue(payload["success"])
         self.assertEqual(payload["run"]["id"], self.run.id)

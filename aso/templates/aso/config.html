@@ -37,6 +37,11 @@
             <span class="text-slate-300">(none)</span>
             {% endif %}
         </div>
+        <div class="text-xs text-slate-500">
+            Online market context: <span class="text-slate-300">{% if effective_online_context_enabled %}Enabled{% else %}Disabled{% endif %}</span>
+            · Top apps/country: <span class="text-slate-300">{{ effective_online_top_apps_per_country }}</span>
+            · History rows to AI: <span class="text-slate-300">{{ effective_history_rows_max }}</span>
+        </div>
     </div>
 
     <div class="bg-[#1e293b] border border-white/10 rounded-xl p-4">
@@ -63,6 +68,37 @@
                 <label for="{{ form.openai_available_models.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.openai_available_models.label }}</label>
                 {{ form.openai_available_models }}
                 <p class="text-xs text-slate-500 mt-1">{{ form.openai_available_models.help_text }}</p>
+            </div>
+
+            <div class="pt-2 border-t border-white/10">
+                <h3 class="text-sm font-semibold text-white mb-3">Data Scope + Online Enrichment</h3>
+                <div class="flex items-center gap-2 text-sm text-slate-300 mb-3">
+                    {{ form.ai_enable_online_context }}
+                    <label for="{{ form.ai_enable_online_context.id_for_label }}">{{ form.ai_enable_online_context.label }}</label>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label for="{{ form.ai_online_top_apps_per_country.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.ai_online_top_apps_per_country.label }}</label>
+                        {{ form.ai_online_top_apps_per_country }}
+                    </div>
+                    <div>
+                        <label for="{{ form.ai_history_rows_max.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.ai_history_rows_max.label }}</label>
+                        {{ form.ai_history_rows_max }}
+                    </div>
+                </div>
+            </div>
+
+            <div class="pt-2 border-t border-white/10">
+                <h3 class="text-sm font-semibold text-white mb-3">Prompt Tuning</h3>
+                <div>
+                    <label for="{{ form.ai_system_prompt.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.ai_system_prompt.label }}</label>
+                    {{ form.ai_system_prompt }}
+                </div>
+                <div class="mt-3">
+                    <label for="{{ form.ai_user_prompt_template.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.ai_user_prompt_template.label }}</label>
+                    {{ form.ai_user_prompt_template }}
+                    <p class="text-xs text-slate-500 mt-1">{{ form.ai_user_prompt_template.help_text }}</p>
+                </div>
             </div>
 
             <div class="flex justify-end">
