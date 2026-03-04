@@ -349,3 +349,30 @@ class RuntimeConfigViewTests(TestCase):
         self.assertEqual(cfg.openai_api_key, "sk-test-123")
         self.assertEqual(cfg.openai_default_model, "gpt-4.1-mini")
         self.assertEqual(cfg.openai_available_models, "gpt-4.1-mini,gpt-4.1")
+
+
+class DashboardServerSortTests(TestCase):
+    def test_popularity_sort_is_global_before_pagination(self):
+        app = App.objects.create(name="Sort App", track_id=424242)
+        for i in range(1, 31):
+            kw = Keyword.objects.create(keyword=f"sort-keyword-{i}", app=app)
+            SearchResult.create_snapshot(
+                keyword=kw,
+                country="us",
+                source=SearchResult.SOURCE_MANUAL_SEARCH,
+                popularity_score=i,
+                difficulty_score=50,
+                difficulty_breakdown={},
+                competitors_data=[],
+                app_rank=None,
+            )
+
+        response = self.client.get(
+            reverse("aso:dashboard"),
+            {"sort": "popularity", "dir": "asc", "page": "2"},
+        )
+        self.assertEqual(response.status_code, 200)
+        rows = list(response.context["history_results"])
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(rows[0].popularity_score, 26)
+        self.assertEqual(rows[-1].popularity_score, 30)

@@ -288,22 +288,50 @@
                 <table class="w-full" id="history-table">
                     <thead>
                         <tr class="border-b border-white/10">
-                            <th class="text-left text-xs font-medium text-slate-400 px-3 py-2 cursor-pointer hover:text-slate-200 select-none" onclick="sortTable(0,'text',this)">Keyword <span class="sort-indicator text-slate-600"></span></th>
-                            {% if show_rank %}<th class="text-center text-xs font-medium text-slate-400 px-3 py-2 cursor-pointer hover:text-slate-200 select-none" onclick="sortTable(1,'num',this)">Rank <span class="sort-indicator text-slate-600"></span></th>{% endif %}
-                            <th class="text-center text-xs font-medium text-slate-400 px-3 py-2 cursor-pointer hover:text-slate-200 select-none" onclick="sortTable({% if show_rank %}2{% else %}1{% endif %},'num',this)">Popularity <span class="sort-indicator text-slate-600"></span></th>
-                            <th class="text-center text-xs font-medium text-slate-400 px-3 py-2 cursor-pointer hover:text-slate-200 select-none" onclick="sortTable({% if show_rank %}3{% else %}2{% endif %},'num',this)">
-                                <span class="inline-flex items-center gap-1">Overall Difficulty
+                            <th class="text-left text-xs font-medium text-slate-400 px-3 py-2">
+                                <a href="?{{ sort_links.keyword }}" class="hover:text-slate-200 select-none inline-flex items-center">
+                                    Keyword{% if current_sort == 'keyword' %} <span class="text-purple-400">{% if current_sort_dir == 'asc' %}▲{% else %}▼{% endif %}</span>{% endif %}
+                                </a>
+                            </th>
+                            {% if show_rank %}
+                            <th class="text-center text-xs font-medium text-slate-400 px-3 py-2">
+                                <a href="?{{ sort_links.rank }}" class="hover:text-slate-200 select-none inline-flex items-center">
+                                    Rank{% if current_sort == 'rank' %} <span class="text-purple-400">{% if current_sort_dir == 'asc' %}▲{% else %}▼{% endif %}</span>{% endif %}
+                                </a>
+                            </th>
+                            {% endif %}
+                            <th class="text-center text-xs font-medium text-slate-400 px-3 py-2">
+                                <a href="?{{ sort_links.popularity }}" class="hover:text-slate-200 select-none inline-flex items-center">
+                                    Popularity{% if current_sort == 'popularity' %} <span class="text-purple-400">{% if current_sort_dir == 'asc' %}▲{% else %}▼{% endif %}</span>{% endif %}
+                                </a>
+                            </th>
+                            <th class="text-center text-xs font-medium text-slate-400 px-3 py-2">
+                                <a href="?{{ sort_links.difficulty }}" class="hover:text-slate-200 select-none inline-flex items-center">
+                                    <span class="inline-flex items-center gap-1">Overall Difficulty
                                     <svg class="w-3.5 h-3.5 text-slate-500 cursor-help" fill="none" stroke="currentColor" viewBox="0 0 24 24" data-tip="Weighted score (0–100) based on 7 competition signals across all search results: rating volume, growth speed, brand strength, title relevance, rating quality, market maturity, and publisher diversity."><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
-                                </span>
-                                <span class="sort-indicator text-slate-600"></span>
+                                    </span>
+                                    {% if current_sort == 'difficulty' %} <span class="text-purple-400">{% if current_sort_dir == 'asc' %}▲{% else %}▼{% endif %}</span>{% endif %}
+                                </a>
                             </th>
                             <th class="text-center text-xs font-medium text-slate-400 px-3 py-2">Ranking Difficulty
                                 <svg class="w-3.5 h-3.5 text-slate-500 cursor-help inline" fill="none" stroke="currentColor" viewBox="0 0 24 24" data-tip="Difficulty score computed for reaching the Top 5, Top 10, and Top 20 positions specifically, based on the competitors in each tier."><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                             </th>
                             <th class="text-left text-xs font-medium text-slate-400 px-3 py-2">Insight</th>
-                            <th class="text-left text-xs font-medium text-slate-400 px-3 py-2 cursor-pointer hover:text-slate-200 select-none" onclick="sortTable({% if show_rank %}6{% else %}5{% endif %},'text',this)">Country <span class="sort-indicator text-slate-600"></span></th>
-                            <th class="text-center text-xs font-medium text-slate-400 px-3 py-2 cursor-pointer hover:text-slate-200 select-none" onclick="sortTable({% if show_rank %}7{% else %}6{% endif %},'num',this)">Competitors <span class="sort-indicator text-slate-600"></span></th>
-                            <th class="text-left text-xs font-medium text-slate-400 px-3 py-2 cursor-pointer hover:text-slate-200 select-none" onclick="sortTable({% if show_rank %}8{% else %}7{% endif %},'date',this)">Date <span class="sort-indicator text-slate-600"></span></th>
+                            <th class="text-left text-xs font-medium text-slate-400 px-3 py-2">
+                                <a href="?{{ sort_links.country }}" class="hover:text-slate-200 select-none inline-flex items-center">
+                                    Country{% if current_sort == 'country' %} <span class="text-purple-400">{% if current_sort_dir == 'asc' %}▲{% else %}▼{% endif %}</span>{% endif %}
+                                </a>
+                            </th>
+                            <th class="text-center text-xs font-medium text-slate-400 px-3 py-2">
+                                <a href="?{{ sort_links.competitors }}" class="hover:text-slate-200 select-none inline-flex items-center">
+                                    Competitors{% if current_sort == 'competitors' %} <span class="text-purple-400">{% if current_sort_dir == 'asc' %}▲{% else %}▼{% endif %}</span>{% endif %}
+                                </a>
+                            </th>
+                            <th class="text-left text-xs font-medium text-slate-400 px-3 py-2">
+                                <a href="?{{ sort_links.date }}" class="hover:text-slate-200 select-none inline-flex items-center">
+                                    Date{% if current_sort == 'date' %} <span class="text-purple-400">{% if current_sort_dir == 'asc' %}▲{% else %}▼{% endif %}</span>{% endif %}
+                                </a>
+                            </th>
                             <th class="text-right text-xs font-medium text-slate-400 px-3 py-2 w-20">Actions</th>
                         </tr>
                     </thead>
@@ -589,14 +617,14 @@
         {% if total_pages > 1 %}
         <div class="flex items-center justify-center gap-2 mt-3">
             {% if has_prev %}
-            <a href="?{% if selected_app %}app={{ selected_app }}&{% endif %}{% if selected_country %}country={{ selected_country }}&{% endif %}page={{ page|add:"-1" }}"
+            <a href="?{{ prev_query }}"
                class="text-sm text-slate-400 hover:text-white bg-slate-700/50 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition-colors">
                 ← Prev
             </a>
             {% endif %}
             <span class="text-xs text-slate-500">Page {{ page }} of {{ total_pages }}</span>
             {% if has_next %}
-            <a href="?{% if selected_app %}app={{ selected_app }}&{% endif %}{% if selected_country %}country={{ selected_country }}&{% endif %}page={{ page|add:"1" }}"
+            <a href="?{{ next_query }}"
                class="text-sm text-slate-400 hover:text-white bg-slate-700/50 hover:bg-slate-700 px-3 py-1.5 rounded-lg transition-colors">
                 Next →
             </a>
@@ -818,72 +846,6 @@ function updateCountryBtnText() {
 }
 
 initCountryDropdown();
-
-// --- Sortable Table ---
-let sortCol = -1;
-let sortAsc = true;
-
-function sortTable(colIndex, type, th) {
-    const tbody = document.getElementById('history-body');
-    if (!tbody) return;
-
-    const dataRows = [];
-    const allRows = Array.from(tbody.children);
-
-    for (let i = 0; i < allRows.length; i++) {
-        const row = allRows[i];
-        if (row.classList.contains('competitor-row')) continue;
-        const next = allRows[i + 1];
-        const compRow = (next && next.classList.contains('competitor-row')) ? next : null;
-        dataRows.push({ row, compRow });
-    }
-
-    if (sortCol === colIndex) {
-        sortAsc = !sortAsc;
-    } else {
-        sortCol = colIndex;
-        sortAsc = true;
-    }
-
-    document.querySelectorAll('.sort-indicator').forEach(s => s.textContent = '');
-    const indicator = th.querySelector('.sort-indicator');
-    if (indicator) indicator.textContent = sortAsc ? ' ▲' : ' ▼';
-
-    dataRows.sort((a, b) => {
-        const cellA = a.row.children[colIndex];
-        const cellB = b.row.children[colIndex];
-        let valA = (cellA ? cellA.textContent : '').trim();
-        let valB = (cellB ? cellB.textContent : '').trim();
-
-        if (type === 'num') {
-            const rawA = cellA && cellA.dataset.sortValue !== undefined ? cellA.dataset.sortValue : valA;
-            const rawB = cellB && cellB.dataset.sortValue !== undefined ? cellB.dataset.sortValue : valB;
-            const isEmptyA = !rawA || rawA === '—' || rawA === 'N/A';
-            const isEmptyB = !rawB || rawB === '—' || rawB === 'N/A';
-            if (isEmptyA && !isEmptyB) return 1;
-            if (!isEmptyA && isEmptyB) return -1;
-            if (isEmptyA && isEmptyB) return 0;
-            const numA = parseFloat(rawA.replace(/[^0-9.\-]/g, '')) || 0;
-            const numB = parseFloat(rawB.replace(/[^0-9.\-]/g, '')) || 0;
-            return sortAsc ? numA - numB : numB - numA;
-        } else if (type === 'date') {
-            const dA = new Date(valA) || 0;
-            const dB = new Date(valB) || 0;
-            return sortAsc ? dA - dB : dB - dA;
-        } else {
-            valA = valA.toLowerCase();
-            valB = valB.toLowerCase();
-            if (valA < valB) return sortAsc ? -1 : 1;
-            if (valA > valB) return sortAsc ? 1 : -1;
-            return 0;
-        }
-    });
-
-    dataRows.forEach(({ row, compRow }) => {
-        tbody.appendChild(row);
-        if (compRow) tbody.appendChild(compRow);
-    });
-}
 
 // --- Convert UTC dates to local timezone ---
 function convertDatesToLocal() {
@@ -1422,8 +1384,11 @@ document.addEventListener('DOMContentLoaded', function() {
         const savedApp = localStorage.getItem('aso_app');
         if (savedApp && globalApp.querySelector(`option[value="${savedApp}"]`)) {
             globalApp.value = savedApp;
-            // Redirect to apply the filter
-            window.location.href = `?app=${savedApp}`;
+            // Redirect to apply the filter while preserving sort/country state
+            const params = new URLSearchParams(window.location.search);
+            params.set('app', savedApp);
+            const qs = params.toString();
+            window.location.href = qs ? `?${qs}` : `?app=${savedApp}`;
             return;
         }
     }
@@ -1447,6 +1412,10 @@ document.addEventListener('DOMContentLoaded', function() {
         if (appId) params.set('app', appId);
         const currentCountry = urlParams.get('country');
         if (currentCountry) params.set('country', currentCountry);
+        const currentSort = urlParams.get('sort');
+        const currentDir = urlParams.get('dir');
+        if (currentSort) params.set('sort', currentSort);
+        if (currentDir) params.set('dir', currentDir);
         const qs = params.toString();
         if (aiSuggestionsLink) {
             aiSuggestionsLink.href = appId

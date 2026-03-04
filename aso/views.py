@@ -88,6 +88,21 @@ def dashboard_view(request):
     # --- History table (latest result per keyword+country) ---
     app_id = request.GET.get("app")
     country_filter = request.GET.get("country", "")
+    sort_key = str(request.GET.get("sort", "date")).strip().lower()
+    sort_dir = str(request.GET.get("dir", "desc")).strip().lower()
+    valid_sort_keys = {
+        "keyword",
+        "rank",
+        "popularity",
+        "difficulty",
+        "country",
+        "competitors",
+        "date",
+    }
+    if sort_key not in valid_sort_keys:
+        sort_key = "date"
+    if sort_dir not in {"asc", "desc"}:
+        sort_dir = "desc"
 
     # Get the latest result ID for each keyword+country pair
     from django.db.models import Max
@@ -123,8 +138,42 @@ def dashboard_view(request):
         SearchResult.objects
         .filter(id__in=latest_ids)
         .select_related("keyword", "keyword__app")
-        .order_by("-searched_at")
     )
+    sorted_results = list(results_qs)
+
+    def _sort_results(rows):
+        if sort_key == "keyword":
+            rows.sort(key=lambda r: (r.keyword.keyword or "").lower(), reverse=(sort_dir == "desc"))
+        elif sort_key == "rank":
+            if sort_dir == "asc":
+                rows.sort(key=lambda r: (r.app_rank is None, r.app_rank if r.app_rank is not None else 10**9))
+            else:
+                rows.sort(key=lambda r: (r.app_rank is None, -(r.app_rank or 0)))
+        elif sort_key == "popularity":
+            if sort_dir == "asc":
+                rows.sort(
+                    key=lambda r: (
+                        r.popularity_score is None,
+                        r.popularity_score if r.popularity_score is not None else 10**9,
+                    )
+                )
+            else:
+                rows.sort(
+                    key=lambda r: (
+                        r.popularity_score is None,
+                        -(r.popularity_score or 0),
+                    )
+                )
+        elif sort_key == "difficulty":
+            rows.sort(key=lambda r: r.difficulty_score or 0, reverse=(sort_dir == "desc"))
+        elif sort_key == "country":
+            rows.sort(key=lambda r: (r.country or "").lower(), reverse=(sort_dir == "desc"))
+        elif sort_key == "competitors":
+            rows.sort(key=lambda r: len(r.competitors_data or []), reverse=(sort_dir == "desc"))
+        else:  # date
+            rows.sort(key=lambda r: r.searched_at or timezone.now(), reverse=(sort_dir == "desc"))
+
+    _sort_results(sorted_results)
 
     # Count unique keywords for the toolbar
     keyword_qs = Keyword.objects.all()
@@ -140,11 +189,11 @@ def dashboard_view(request):
         page = 1
 
     per_page = 25
-    total_count = results_qs.count()
+    total_count = len(sorted_results)
     total_pages = max(1, (total_count + per_page - 1) // per_page)
     page = min(page, total_pages)
     start = (page - 1) * per_page
-    history_results = list(results_qs[start : start + per_page])
+    history_results = sorted_results[start : start + per_page]
 
     # Annotate each result with trend data (previous result comparison)
     for result in history_results:
@@ -194,6 +243,28 @@ def dashboard_view(request):
             if selected_app_obj.track_id:
                 show_rank = True
 
+    base_params = request.GET.copy()
+    if "page" in base_params:
+        base_params.pop("page")
+    sort_links = {}
+    for key in valid_sort_keys:
+        params = base_params.copy()
+        next_dir = "desc" if (sort_key == key and sort_dir == "asc") else "asc"
+        params["sort"] = key
+        params["dir"] = next_dir
+        sort_links[key] = params.urlencode()
+
+    prev_query = ""
+    next_query = ""
+    if page > 1:
+        prev_params = base_params.copy()
+        prev_params["page"] = page - 1
+        prev_query = prev_params.urlencode()
+    if page < total_pages:
+        next_params = base_params.copy()
+        next_params["page"] = page + 1
+        next_query = next_params.urlencode()
+
     return render(
         request,
         "aso/dashboard.html",
@@ -213,6 +284,11 @@ def dashboard_view(request):
             "total_count": total_count,
             "has_prev": page > 1,
             "has_next": page < total_pages,
+            "current_sort": sort_key,
+            "current_sort_dir": sort_dir,
+            "sort_links": sort_links,
+            "prev_query": prev_query,
+            "next_query": next_query,
         },
     )
 
