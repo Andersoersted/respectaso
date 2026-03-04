@@ -6,7 +6,7 @@ annotated-types==0.7.0
 anyio==4.12.1
 asgiref==3.11.1
 certifi==2026.2.25
-cffi==1.17.1
+cffi==2.0.0
 charset-normalizer==3.4.4
 cryptography==44.0.3
 distro==1.9.0
@@ -20,7 +20,7 @@ idna==3.11
 jiter==0.13.0
 openai==2.11.0
 packaging==26.0
-pycparser==2.22
+pycparser==2.23
 PyJWT==2.10.1
 pydantic==2.12.5
 pydantic_core==2.41.5
