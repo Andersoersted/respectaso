@@ -35,15 +35,15 @@ def _tokenize(text: str) -> set[str]:
     return set(WORD_RE.findall((text or "").lower()))
 
 
-def _build_openai_client():
-    if not settings.OPENAI_API_KEY:
+def _build_openai_client(api_key: str):
+    if not api_key:
         raise AISuggestionError("OPENAI_API_KEY is not configured.")
     try:
         from openai import OpenAI
     except Exception as exc:  # pragma: no cover - import guard
         raise AISuggestionError("OpenAI SDK is not installed. Add `openai` to requirements.") from exc
     return OpenAI(
-        api_key=settings.OPENAI_API_KEY,
+        api_key=api_key,
         timeout=settings.OPENAI_TIMEOUT_SECONDS,
         max_retries=settings.OPENAI_MAX_RETRIES,
     )
@@ -158,8 +158,8 @@ def _json_schema():
     }
 
 
-def _generate_candidates(snapshot: dict, model: str) -> list[dict]:
-    client = _build_openai_client()
+def _generate_candidates(snapshot: dict, model: str, api_key: str) -> list[dict]:
+    client = _build_openai_client(api_key)
     prompt = (
         "You are an App Store Optimization analyst for Apple App Store only.\n"
         "Generate candidate keywords for this exact app.\n"
@@ -296,12 +296,18 @@ def _evaluate_keyword(
 
 
 @transaction.atomic
-def generate_ai_suggestions(app: App, *, model: str | None = None) -> AISuggestionRun:
+def generate_ai_suggestions(
+    app: App,
+    *,
+    model: str | None = None,
+    api_key: str | None = None,
+) -> AISuggestionRun:
     if not app.track_id:
         raise AISuggestionError("This app must be linked via App Store lookup (track_id) before AI suggestions.")
     chosen_model = (model or settings.OPENAI_MODEL).strip()
     if not chosen_model:
         raise AISuggestionError("No AI model selected.")
+    chosen_api_key = (api_key or settings.OPENAI_API_KEY).strip()
 
     countries = _choose_countries(app)
     snapshot = _build_input_snapshot(app, countries)
@@ -315,7 +321,7 @@ def generate_ai_suggestions(app: App, *, model: str | None = None) -> AISuggesti
     )
 
     try:
-        raw_candidates = _generate_candidates(snapshot, chosen_model)
+        raw_candidates = _generate_candidates(snapshot, chosen_model, chosen_api_key)
         existing_keywords = {
             _clean_candidate_keyword(value)
             for value in Keyword.objects.filter(app=app).values_list("keyword", flat=True)

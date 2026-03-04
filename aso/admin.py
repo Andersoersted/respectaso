@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import AISuggestion, AISuggestionRun, App, Keyword, RefreshRun, SearchResult
+from .models import AISuggestion, AISuggestionRun, App, Keyword, RefreshRun, RuntimeConfig, SearchResult
 
 
 @admin.register(App)
@@ -52,3 +52,9 @@ class AISuggestionAdmin(admin.ModelAdmin):
     list_filter = ("status", "created_at")
     search_fields = ("keyword", "app__name")
     readonly_fields = ("created_at", "resolved_at")
+
+
+@admin.register(RuntimeConfig)
+class RuntimeConfigAdmin(admin.ModelAdmin):
+    list_display = ("singleton_key", "openai_default_model", "updated_at")
+    readonly_fields = ("singleton_key", "updated_at")

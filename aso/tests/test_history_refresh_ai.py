@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from django.core.management import call_command
 from django.test import TestCase, override_settings
@@ -9,7 +9,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from aso.ai_service import AISuggestionError, accept_ai_suggestion, generate_ai_suggestions
-from aso.models import AISuggestion, AISuggestionRun, App, Keyword, RefreshRun, SearchResult
+from aso.models import AISuggestion, AISuggestionRun, App, Keyword, RefreshRun, RuntimeConfig, SearchResult
 from aso.refresh_service import cleanup_old_results
 
 
@@ -254,7 +254,7 @@ class AISuggestionEndpointTests(TestCase):
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 200)
-        mock_generate.assert_called_once_with(self.app, model="gpt-4.1-mini")
+        mock_generate.assert_called_once_with(self.app, model="gpt-4.1-mini", api_key=ANY)
         payload = response.json()
         self.assertTrue(payload["success"])
         self.assertEqual(payload["run"]["id"], self.run.id)
@@ -308,3 +308,25 @@ class AISuggestionEndpointTests(TestCase):
         self.assertEqual(reject_resp.status_code, 200)
         draft.refresh_from_db()
         self.assertEqual(draft.status, AISuggestion.STATUS_REJECTED)
+
+
+class RuntimeConfigViewTests(TestCase):
+    def test_config_page_renders(self):
+        response = self.client.get(reverse("aso:config"))
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Config")
+
+    def test_config_page_updates_runtime_settings(self):
+        response = self.client.post(
+            reverse("aso:config"),
+            data={
+                "openai_api_key": "sk-test-123",
+                "openai_default_model": "gpt-4.1-mini",
+                "openai_available_models": "gpt-4.1-mini,gpt-4.1",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        cfg = RuntimeConfig.get_solo()
+        self.assertEqual(cfg.openai_api_key, "sk-test-123")
+        self.assertEqual(cfg.openai_default_model, "gpt-4.1-mini")
+        self.assertEqual(cfg.openai_available_models, "gpt-4.1-mini,gpt-4.1")

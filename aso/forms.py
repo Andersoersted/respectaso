@@ -113,3 +113,70 @@ class OpportunitySearchForm(forms.Form):
         required=False,
         widget=forms.HiddenInput(),
     )
+
+
+class RuntimeConfigForm(forms.Form):
+    openai_api_key = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(
+            render_value=False,
+            attrs={
+                "class": "w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500",
+                "placeholder": "sk-... (leave blank to keep current key)",
+            },
+        ),
+        label="OpenAI API Key",
+    )
+    clear_openai_api_key = forms.BooleanField(
+        required=False,
+        widget=forms.CheckboxInput(
+            attrs={
+                "class": "rounded border-white/20 bg-slate-700 text-purple-500 focus:ring-purple-500",
+            }
+        ),
+        label="Clear stored API key override",
+    )
+    openai_default_model = forms.CharField(
+        required=False,
+        widget=forms.TextInput(
+            attrs={
+                "class": "w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500",
+                "placeholder": "gpt-4.1-mini",
+            }
+        ),
+        label="Default AI Model",
+    )
+    openai_available_models = forms.CharField(
+        required=False,
+        widget=forms.TextInput(
+            attrs={
+                "class": "w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500",
+                "placeholder": "gpt-4.1-mini,gpt-4.1,gpt-4o-mini",
+            }
+        ),
+        label="Available Models",
+        help_text="Comma-separated models shown in the AI Suggestions model dropdown.",
+    )
+
+    def __init__(self, *args, config, **kwargs):
+        self.config = config
+        super().__init__(*args, **kwargs)
+        self.fields["openai_default_model"].initial = config.openai_default_model
+        self.fields["openai_available_models"].initial = config.openai_available_models
+
+    def save(self):
+        if self.cleaned_data.get("clear_openai_api_key"):
+            self.config.openai_api_key = ""
+        else:
+            incoming_key = (self.cleaned_data.get("openai_api_key") or "").strip()
+            if incoming_key:
+                self.config.openai_api_key = incoming_key
+
+        self.config.openai_default_model = (
+            self.cleaned_data.get("openai_default_model") or ""
+        ).strip()
+        self.config.openai_available_models = (
+            self.cleaned_data.get("openai_available_models") or ""
+        ).strip()
+        self.config.save()
+        return self.config

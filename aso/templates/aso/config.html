@@ -1,0 +1,76 @@
+{% extends "aso/base.html" %}
+
+{% block title %}Config — RespectASO{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl mx-auto space-y-5">
+    <div>
+        <h1 class="text-xl font-bold text-white">Config</h1>
+        <p class="text-slate-400 text-sm mt-0.5">Manage runtime settings for AI suggestions.</p>
+    </div>
+
+    {% if saved %}
+    <div class="bg-green-900/30 border border-green-500/30 rounded-xl p-3 text-sm text-green-200">
+        Configuration saved.
+    </div>
+    {% endif %}
+
+    <div class="bg-[#1e293b] border border-white/10 rounded-xl p-4 space-y-3">
+        <h2 class="text-base font-semibold text-white">OpenAI</h2>
+        <div class="text-xs text-slate-400">
+            API key status:
+            {% if api_key_set %}
+            <span class="text-green-300 font-medium">Configured</span>
+            <span class="text-slate-500">({{ api_key_source }})</span>
+            {% else %}
+            <span class="text-red-300 font-medium">Missing</span>
+            {% endif %}
+        </div>
+        <div class="text-xs text-slate-500">
+            Effective default model: <span class="text-slate-300">{{ effective_default_model|default:"(none)" }}</span>
+        </div>
+        <div class="text-xs text-slate-500">
+            Effective available models:
+            {% if effective_available_models %}
+            <span class="text-slate-300">{{ effective_available_models|join:", " }}</span>
+            {% else %}
+            <span class="text-slate-300">(none)</span>
+            {% endif %}
+        </div>
+    </div>
+
+    <div class="bg-[#1e293b] border border-white/10 rounded-xl p-4">
+        <form method="post" class="space-y-4">
+            {% csrf_token %}
+
+            <div>
+                <label for="{{ form.openai_api_key.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.openai_api_key.label }}</label>
+                {{ form.openai_api_key }}
+            </div>
+
+            <div class="flex items-center gap-2 text-sm text-slate-300">
+                {{ form.clear_openai_api_key }}
+                <label for="{{ form.clear_openai_api_key.id_for_label }}">{{ form.clear_openai_api_key.label }}</label>
+            </div>
+
+            <div>
+                <label for="{{ form.openai_default_model.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.openai_default_model.label }}</label>
+                {{ form.openai_default_model }}
+                <p class="text-xs text-slate-500 mt-1">Leave empty to use <code>OPENAI_MODEL</code> from environment.</p>
+            </div>
+
+            <div>
+                <label for="{{ form.openai_available_models.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.openai_available_models.label }}</label>
+                {{ form.openai_available_models }}
+                <p class="text-xs text-slate-500 mt-1">{{ form.openai_available_models.help_text }}</p>
+            </div>
+
+            <div class="flex justify-end">
+                <button type="submit" class="bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium px-4 py-2.5 rounded-lg transition-colors">
+                    Save Configuration
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}

@@ -409,3 +409,33 @@ class AISuggestion(models.Model):
 
     def __str__(self):
         return f"{self.keyword} ({self.status})"
+
+
+class RuntimeConfig(models.Model):
+    """
+    Singleton runtime configuration overrides persisted in the DB.
+
+    Values here override environment defaults and are stored in /app/data via SQLite.
+    """
+
+    singleton_key = models.PositiveSmallIntegerField(default=1, unique=True, editable=False)
+    openai_api_key = models.CharField(max_length=255, blank=True, default="")
+    openai_default_model = models.CharField(max_length=100, blank=True, default="")
+    openai_available_models = models.TextField(
+        blank=True,
+        default="",
+        help_text="Comma-separated list of models shown in the AI Suggestions dropdown.",
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Runtime Config"
+        verbose_name_plural = "Runtime Config"
+
+    @classmethod
+    def get_solo(cls):
+        obj, _ = cls.objects.get_or_create(singleton_key=1)
+        return obj
+
+    def __str__(self):
+        return "Runtime Config"

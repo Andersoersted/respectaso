@@ -11,8 +11,8 @@ from django.utils import timezone
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
-from .forms import AppForm, KeywordSearchForm, OpportunitySearchForm, COUNTRY_CHOICES
-from .models import AISuggestion, AISuggestionRun, App, Keyword, RefreshRun, SearchResult
+from .forms import AppForm, KeywordSearchForm, OpportunitySearchForm, RuntimeConfigForm, COUNTRY_CHOICES
+from .models import AISuggestion, AISuggestionRun, App, Keyword, RefreshRun, RuntimeConfig, SearchResult
 from .ai_service import (
     AISuggestionError,
     accept_ai_suggestion,
@@ -41,6 +41,34 @@ def methodology_view(request):
 def setup_view(request):
     """Setup guide — custom domain, Docker config, and getting started."""
     return render(request, "aso/setup.html")
+
+
+def config_view(request):
+    """In-app runtime configuration (OpenAI overrides + model list)."""
+    runtime_config = RuntimeConfig.get_solo()
+    saved = False
+
+    if request.method == "POST":
+        form = RuntimeConfigForm(request.POST, config=runtime_config)
+        if form.is_valid():
+            runtime_config = form.save()
+            saved = True
+    else:
+        form = RuntimeConfigForm(config=runtime_config)
+
+    effective = _effective_ai_settings()
+    return render(
+        request,
+        "aso/config.html",
+        {
+            "form": form,
+            "saved": saved,
+            "api_key_set": bool(effective["api_key"]),
+            "api_key_source": effective["api_key_source"],
+            "effective_default_model": effective["default_model"],
+            "effective_available_models": effective["available_models"],
+        },
+    )
 
 
 def dashboard_view(request):
@@ -917,14 +945,51 @@ def _get_app_by_id_param(app_id_raw):
     return App.objects.filter(id=app_id).first()
 
 
-def _resolve_model_choice(model_raw):
+def _parse_csv_models(raw: str) -> list[str]:
+    items = []
+    for item in str(raw or "").split(","):
+        value = item.strip()
+        if value and value not in items:
+            items.append(value)
+    return items
+
+
+def _effective_ai_settings() -> dict:
+    runtime = RuntimeConfig.get_solo()
+    api_key = runtime.openai_api_key.strip() or settings.OPENAI_API_KEY
+    default_model = runtime.openai_default_model.strip() or settings.OPENAI_MODEL
+    model_csv = runtime.openai_available_models.strip()
+    if not model_csv:
+        model_csv = ",".join(settings.OPENAI_AVAILABLE_MODELS)
+    available_models = _parse_csv_models(model_csv)
+    if default_model and default_model not in available_models:
+        available_models.insert(0, default_model)
+    if not available_models and default_model:
+        available_models = [default_model]
+
+    api_key_source = "none"
+    if runtime.openai_api_key.strip():
+        api_key_source = "config"
+    elif settings.OPENAI_API_KEY:
+        api_key_source = "env"
+
+    return {
+        "api_key": api_key,
+        "default_model": default_model,
+        "available_models": available_models,
+        "api_key_source": api_key_source,
+    }
+
+
+def _resolve_model_choice(model_raw, *, default_model: str, allowed_models: list[str]):
     model = str(model_raw or "").strip()
     if not model:
-        return settings.OPENAI_MODEL
-    allowed_models = list(settings.OPENAI_AVAILABLE_MODELS or [])
+        model = default_model
+    if not model:
+        raise AISuggestionError("No AI model configured.")
     if allowed_models and model not in allowed_models:
         raise AISuggestionError(
-            f"Model '{model}' is not allowed. Configure OPENAI_AVAILABLE_MODELS to allow it."
+            f"Model '{model}' is not allowed. Configure allowed models on the Config page."
         )
     return model
 
@@ -938,6 +1003,7 @@ def ai_suggestions_view(request):
         return JsonResponse(_ai_payload_for_app(app))
 
     apps = App.objects.all()
+    effective = _effective_ai_settings()
     selected_app = request.GET.get("app")
     try:
         selected_app_id = int(selected_app) if selected_app else None
@@ -949,8 +1015,8 @@ def ai_suggestions_view(request):
         {
             "apps": apps,
             "selected_app": selected_app_id,
-            "available_models": settings.OPENAI_AVAILABLE_MODELS,
-            "default_model": settings.OPENAI_MODEL,
+            "available_models": effective["available_models"],
+            "default_model": effective["default_model"],
         },
     )
 
@@ -976,10 +1042,19 @@ def ai_suggestions_generate_view(request):
         return JsonResponse({"error": "app_id is required."}, status=400)
     app = get_object_or_404(App, id=app_id)
     model = body.get("model")
+    effective = _effective_ai_settings()
 
     try:
-        selected_model = _resolve_model_choice(model)
-        run = generate_ai_suggestions(app, model=selected_model)
+        selected_model = _resolve_model_choice(
+            model,
+            default_model=effective["default_model"],
+            allowed_models=effective["available_models"],
+        )
+        run = generate_ai_suggestions(
+            app,
+            model=selected_model,
+            api_key=effective["api_key"],
+        )
     except AISuggestionError as exc:
         return JsonResponse({"error": str(exc)}, status=400)
     except Exception as exc:  # pragma: no cover - defensive runtime path

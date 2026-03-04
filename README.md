@@ -175,6 +175,7 @@ AI_MAX_COUNTRIES=3
 
 `AUTO_REFRESH_MODE=external` is recommended in production (Dokploy/cron).
 `AUTO_REFRESH_MODE=thread` keeps the in-process hourly checker fallback.
+You can also manage OpenAI key/model settings in-app at `/config/` (stored in SQLite under `/app/data`).
 
 ### Daily Cron Refresh (Recommended)
 
