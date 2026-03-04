@@ -36,7 +36,7 @@ Most ASO tools require paid subscriptions, API keys, and send your keyword resea
 | **Search History** | Browse past keyword research with sorting, filtering, and expandable detail views |
 | **Append-Only Trend History** | Every refresh can be stored as a new snapshot (including same-day runs) for richer trend analysis |
 | **Daily Auto Refresh (Cron)** | Refresh all tracked keyword-country pairs once per day via management command (recommended for Dokploy cron) |
-| **AI Keyword Suggestions (Apple-only)** | Generate app-specific keyword drafts using OpenAI + current market data + your historical results |
+| **AI Copilot (Apple-only)** | On-demand keyword recommendations + metadata variants using OpenAI, tracked history, and optional App Store Connect analytics |
 | **CSV Export** | Export your keyword research data for use in spreadsheets |
 | **ASO Targeting Advice** | Automatic keyword classification (Sweet Spot, Hidden Gem, Low Volume, Avoid, etc.) based on popularity vs. difficulty |
 
@@ -157,7 +157,7 @@ Notes:
 
 ### AI + Refresh Settings
 
-Set these in `.env` for AI suggestions and retention/scheduler behavior:
+Set these in `.env` for AI Copilot, App Store Connect sync defaults, and retention/scheduler behavior:
 
 ```bash
 RESULT_RETENTION_DAYS=365
@@ -174,12 +174,28 @@ AI_MAX_COUNTRIES=3
 AI_HISTORY_ROWS_MAX=300
 AI_ENABLE_ONLINE_CONTEXT=true
 AI_ONLINE_TOP_APPS_PER_COUNTRY=20
+ASC_TIMEOUT_SECONDS=30
+ASC_MAX_RETRIES=2
+ASC_DEFAULT_DAYS_BACK=30
+ASC_JWT_TTL_MINUTES=20
 ```
 
 `AUTO_REFRESH_MODE=external` is recommended in production (Dokploy/cron).
 `AUTO_REFRESH_MODE=thread` keeps the in-process hourly checker fallback.
-You can also manage OpenAI key/model settings, prompt templates, and online context controls in-app at `/config/` (stored in SQLite under `/app/data`).
+You can also manage OpenAI key/model settings, prompt templates, online context controls, and App Store Connect credentials in-app at `/config/` (stored in SQLite under `/app/data`).
 Prompt template placeholders: `{{SNAPSHOT_JSON}}` and `{{ONLINE_CONTEXT_JSON}}`.
+
+### App Store Connect Integration (Optional)
+
+AI Copilot can include your own App Store Connect analytics signals (impressions, page views, app units, conversion, proceeds) in scoring.
+
+1. In App Store Connect, create an API key and copy:
+- `Issuer ID`
+- `Key ID`
+- private key PEM content
+2. Add your App Store Connect app ID to each app in RespectASO (`Apps` page, `ASC App ID` field).
+3. Enter credentials on the RespectASO `Config` page.
+4. Use **Sync ASC** in AI Copilot before running recommendations.
 
 ### Daily Cron Refresh (Recommended)
 
@@ -244,7 +260,7 @@ RespectASO is designed with privacy as a core principle:
 - **No accounts** — no registration, no login, no user tracking
 - **No telemetry** — zero analytics, zero phone-home, zero data collection
 - **No API keys required for core ASO** — the core keyword pipeline uses only Apple public APIs
-- **Optional OpenAI integration** — only used when you trigger AI suggestions and provide `OPENAI_API_KEY`
+- **Optional OpenAI integration** — only used when you trigger AI Copilot and provide `OPENAI_API_KEY`
 - **Your data stays yours** — keyword research, competitor analysis, and search history never leave your network
 
 We built RespectASO because we believe developers should be able to research keywords without handing their competitive intelligence to a third party.

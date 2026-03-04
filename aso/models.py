@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from decimal import Decimal
 
 from django.db import models
 from django.db.models import Manager
@@ -49,6 +50,13 @@ class App(models.Model):
         blank=True,
         default="",
         help_text="Developer/publisher name",
+    )
+    asc_app_id = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="App Store Connect app ID used for analytics sync.",
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -105,6 +113,7 @@ class SearchResult(models.Model):
     SOURCE_DAILY_REFRESH = "daily_refresh"
     SOURCE_OPPORTUNITY_SAVE = "opportunity_save"
     SOURCE_AI_SUGGESTION = "ai_suggestion"
+    SOURCE_AI_COPILOT = "ai_copilot"
 
     SOURCE_CHOICES = [
         (SOURCE_MANUAL_SEARCH, "Manual Search"),
@@ -113,6 +122,7 @@ class SearchResult(models.Model):
         (SOURCE_DAILY_REFRESH, "Daily Refresh"),
         (SOURCE_OPPORTUNITY_SAVE, "Opportunity Save"),
         (SOURCE_AI_SUGGESTION, "AI Suggestion"),
+        (SOURCE_AI_COPILOT, "AI Copilot"),
     ]
 
     keyword = models.ForeignKey(
@@ -424,7 +434,7 @@ class RuntimeConfig(models.Model):
     openai_available_models = models.TextField(
         blank=True,
         default="",
-        help_text="Comma-separated list of models shown in the AI Suggestions dropdown.",
+        help_text="Comma-separated list of models shown in the AI Copilot dropdown.",
     )
     ai_system_prompt = models.TextField(blank=True, default="")
     ai_user_prompt_template = models.TextField(blank=True, default="")
@@ -432,7 +442,7 @@ class RuntimeConfig(models.Model):
         null=True,
         blank=True,
         default=None,
-        help_text="Enable online market enrichment for AI suggestions.",
+        help_text="Enable online market enrichment for AI Copilot.",
     )
     ai_online_top_apps_per_country = models.PositiveSmallIntegerField(
         null=True,
@@ -443,6 +453,28 @@ class RuntimeConfig(models.Model):
         null=True,
         blank=True,
         help_text="Maximum number of historical snapshots passed to AI context.",
+    )
+    asc_issuer_id = models.CharField(
+        max_length=128,
+        blank=True,
+        default="",
+        help_text="App Store Connect API issuer ID.",
+    )
+    asc_key_id = models.CharField(
+        max_length=32,
+        blank=True,
+        default="",
+        help_text="App Store Connect API key ID (kid).",
+    )
+    asc_private_key_pem = models.TextField(
+        blank=True,
+        default="",
+        help_text="App Store Connect private key PEM content.",
+    )
+    asc_default_days_back = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Default number of days to sync from App Store Connect.",
     )
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -457,3 +489,199 @@ class RuntimeConfig(models.Model):
 
     def __str__(self):
         return "Runtime Config"
+
+
+class ASCMetricDaily(models.Model):
+    """Daily App Store Connect analytics metrics at app+country granularity."""
+
+    app = models.ForeignKey(App, on_delete=models.CASCADE, related_name="asc_metrics")
+    date = models.DateField(db_index=True)
+    country = models.CharField(max_length=5, default="us")
+    impressions = models.IntegerField(null=True, blank=True)
+    product_page_views = models.IntegerField(null=True, blank=True)
+    app_units = models.IntegerField(null=True, blank=True)
+    conversion_rate = models.FloatField(null=True, blank=True)
+    proceeds = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+    raw_json = models.JSONField(default=dict)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-date", "country"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["app", "date", "country"],
+                name="aso_ascmetric_app_date_country_uniq",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["app", "country", "-date"], name="aso_ascmetric_lookup_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.app.name} {self.country.upper()} {self.date.isoformat()}"
+
+
+class ASCSyncRun(models.Model):
+    """Tracks App Store Connect sync executions."""
+
+    STATUS_RUNNING = "running"
+    STATUS_SUCCESS = "success"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_RUNNING, "Running"),
+        (STATUS_SUCCESS, "Success"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    app = models.ForeignKey(App, on_delete=models.CASCADE, related_name="asc_sync_runs")
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_RUNNING)
+    days_back = models.PositiveSmallIntegerField(default=30)
+    rows_upserted = models.PositiveIntegerField(default=0)
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    error = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-started_at"]
+
+    def __str__(self):
+        return f"ASC sync #{self.pk} ({self.status})"
+
+
+class AICopilotRun(models.Model):
+    """Stores one AI Copilot generation run."""
+
+    STATUS_RUNNING = "running"
+    STATUS_SUCCESS = "success"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_RUNNING, "Running"),
+        (STATUS_SUCCESS, "Success"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    app = models.ForeignKey(App, on_delete=models.CASCADE, related_name="ai_copilot_runs")
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_RUNNING)
+    model = models.CharField(max_length=100)
+    country = models.CharField(max_length=5, default="us")
+    input_snapshot_json = models.JSONField(default=dict)
+    feature_summary_json = models.JSONField(default=dict)
+    error = models.TextField(blank=True, default="")
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+
+    def __str__(self):
+        return f"Copilot run #{self.pk} for {self.app.name}"
+
+
+class AICopilotRecommendation(models.Model):
+    """Keyword-level recommendation produced by AI Copilot."""
+
+    ACTION_ADD = "add"
+    ACTION_PROMOTE = "promote"
+    ACTION_WATCH = "watch"
+    ACTION_DEPRIORITIZE = "deprioritize"
+    ACTION_CHOICES = [
+        (ACTION_ADD, "Add"),
+        (ACTION_PROMOTE, "Promote"),
+        (ACTION_WATCH, "Watch"),
+        (ACTION_DEPRIORITIZE, "Deprioritize"),
+    ]
+
+    STATUS_DRAFT = "draft"
+    STATUS_ACCEPTED = "accepted"
+    STATUS_REJECTED = "rejected"
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_ACCEPTED, "Accepted"),
+        (STATUS_REJECTED, "Rejected"),
+    ]
+
+    run = models.ForeignKey(
+        AICopilotRun,
+        on_delete=models.CASCADE,
+        related_name="recommendations",
+    )
+    app = models.ForeignKey(
+        App,
+        on_delete=models.CASCADE,
+        related_name="ai_copilot_recommendations",
+    )
+    keyword = models.CharField(max_length=200)
+    action = models.CharField(max_length=16, choices=ACTION_CHOICES, default=ACTION_WATCH)
+    rationale = models.TextField(blank=True, default="")
+    llm_confidence = models.FloatField(default=0.0)
+    score_market = models.FloatField(default=0.0)
+    score_rank_momentum = models.FloatField(default=0.0)
+    score_business_impact = models.FloatField(default=0.0)
+    score_coverage_gap = models.FloatField(default=0.0)
+    score_overall = models.FloatField(default=0.0, db_index=True)
+    evidence_json = models.JSONField(default=dict)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_DRAFT, db_index=True)
+    created_keyword = models.ForeignKey(
+        Keyword,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="ai_copilot_recommendations",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-score_overall", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["run", "keyword"],
+                name="aso_copilot_reco_run_keyword_uniq",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.keyword} ({self.action})"
+
+
+class AICopilotMetadataVariant(models.Model):
+    """Metadata variant generated by AI Copilot for manual deployment."""
+
+    STATUS_DRAFT = "draft"
+    STATUS_ACCEPTED = "accepted"
+    STATUS_REJECTED = "rejected"
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_ACCEPTED, "Accepted"),
+        (STATUS_REJECTED, "Rejected"),
+    ]
+
+    run = models.ForeignKey(
+        AICopilotRun,
+        on_delete=models.CASCADE,
+        related_name="metadata_variants",
+    )
+    app = models.ForeignKey(
+        App,
+        on_delete=models.CASCADE,
+        related_name="ai_copilot_metadata_variants",
+    )
+    title = models.CharField(max_length=60)
+    subtitle = models.CharField(max_length=60, blank=True, default="")
+    keyword_field = models.CharField(max_length=180, blank=True, default="")
+    covered_keywords_json = models.JSONField(default=list)
+    predicted_impact = models.FloatField(default=0.0)
+    rationale = models.TextField(blank=True, default="")
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_DRAFT, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-predicted_impact", "-created_at"]
+
+    def __str__(self):
+        return f"Metadata variant #{self.pk} ({self.status})"
