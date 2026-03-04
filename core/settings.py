@@ -153,6 +153,13 @@ if AUTO_REFRESH_MODE not in {"external", "thread"}:
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+OPENAI_AVAILABLE_MODELS = []
+for _model in csv_env("OPENAI_AVAILABLE_MODELS", [OPENAI_MODEL]):
+    _value = _model.strip()
+    if _value and _value not in OPENAI_AVAILABLE_MODELS:
+        OPENAI_AVAILABLE_MODELS.append(_value)
+if OPENAI_MODEL not in OPENAI_AVAILABLE_MODELS:
+    OPENAI_AVAILABLE_MODELS.insert(0, OPENAI_MODEL)
 OPENAI_TIMEOUT_SECONDS = float_env("OPENAI_TIMEOUT_SECONDS", 40.0, min_value=5.0, max_value=300.0)
 OPENAI_MAX_RETRIES = int_env("OPENAI_MAX_RETRIES", 2, min_value=0, max_value=10)
 AI_MAX_CANDIDATES = int_env("AI_MAX_CANDIDATES", 12, min_value=3, max_value=50)

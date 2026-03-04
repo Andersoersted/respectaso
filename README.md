@@ -165,6 +165,7 @@ AUTO_REFRESH_MODE=external
 
 OPENAI_API_KEY=your_key_here
 OPENAI_MODEL=gpt-4.1-mini
+OPENAI_AVAILABLE_MODELS=gpt-4.1-mini,gpt-4.1,gpt-4o-mini
 OPENAI_TIMEOUT_SECONDS=40
 OPENAI_MAX_RETRIES=2
 AI_MAX_CANDIDATES=12
@@ -237,8 +238,8 @@ RespectASO is designed with privacy as a core principle:
 - **100% local** — the tool runs entirely on your machine inside Docker
 - **No accounts** — no registration, no login, no user tracking
 - **No telemetry** — zero analytics, zero phone-home, zero data collection
-- **No API keys** — uses only the public iTunes Search API (no credentials required)
-- **No third-party services** — all API calls go directly from your machine to Apple's public API
+- **No API keys required for core ASO** — the core keyword pipeline uses only Apple public APIs
+- **Optional OpenAI integration** — only used when you trigger AI suggestions and provide `OPENAI_API_KEY`
 - **Your data stays yours** — keyword research, competitor analysis, and search history never leave your network
 
 We built RespectASO because we believe developers should be able to research keywords without handing their competitive intelligence to a third party.

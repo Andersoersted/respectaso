@@ -158,7 +158,7 @@ def _json_schema():
     }
 
 
-def _generate_candidates(snapshot: dict) -> list[dict]:
+def _generate_candidates(snapshot: dict, model: str) -> list[dict]:
     client = _build_openai_client()
     prompt = (
         "You are an App Store Optimization analyst for Apple App Store only.\n"
@@ -170,7 +170,7 @@ def _generate_candidates(snapshot: dict) -> list[dict]:
     )
 
     response = client.chat.completions.create(
-        model=settings.OPENAI_MODEL,
+        model=model,
         temperature=0.2,
         messages=[
             {
@@ -296,9 +296,12 @@ def _evaluate_keyword(
 
 
 @transaction.atomic
-def generate_ai_suggestions(app: App) -> AISuggestionRun:
+def generate_ai_suggestions(app: App, *, model: str | None = None) -> AISuggestionRun:
     if not app.track_id:
         raise AISuggestionError("This app must be linked via App Store lookup (track_id) before AI suggestions.")
+    chosen_model = (model or settings.OPENAI_MODEL).strip()
+    if not chosen_model:
+        raise AISuggestionError("No AI model selected.")
 
     countries = _choose_countries(app)
     snapshot = _build_input_snapshot(app, countries)
@@ -306,13 +309,13 @@ def generate_ai_suggestions(app: App) -> AISuggestionRun:
     run = AISuggestionRun.objects.create(
         app=app,
         status=AISuggestionRun.STATUS_RUNNING,
-        model=settings.OPENAI_MODEL,
+        model=chosen_model,
         countries_json=countries,
         input_snapshot_json=snapshot,
     )
 
     try:
-        raw_candidates = _generate_candidates(snapshot)
+        raw_candidates = _generate_candidates(snapshot, chosen_model)
         existing_keywords = {
             _clean_candidate_keyword(value)
             for value in Keyword.objects.filter(app=app).values_list("keyword", flat=True)

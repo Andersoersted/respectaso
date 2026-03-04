@@ -250,13 +250,24 @@ class AISuggestionEndpointTests(TestCase):
         url = reverse("aso:ai_suggestions_generate")
         response = self.client.post(
             url,
-            data='{"app_id": %d}' % self.app.id,
+            data='{"app_id": %d, "model": "gpt-4.1-mini"}' % self.app.id,
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 200)
+        mock_generate.assert_called_once_with(self.app, model="gpt-4.1-mini")
         payload = response.json()
         self.assertTrue(payload["success"])
         self.assertEqual(payload["run"]["id"], self.run.id)
+
+    @override_settings(OPENAI_AVAILABLE_MODELS=["gpt-4.1-mini"])
+    def test_generate_endpoint_rejects_model_not_in_allow_list(self):
+        url = reverse("aso:ai_suggestions_generate")
+        response = self.client.post(
+            url,
+            data='{"app_id": %d, "model": "gpt-4.1"}' % self.app.id,
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
 
     def test_list_endpoint_returns_suggestions(self):
         url = reverse("aso:ai_suggestions")

@@ -917,6 +917,18 @@ def _get_app_by_id_param(app_id_raw):
     return App.objects.filter(id=app_id).first()
 
 
+def _resolve_model_choice(model_raw):
+    model = str(model_raw or "").strip()
+    if not model:
+        return settings.OPENAI_MODEL
+    allowed_models = list(settings.OPENAI_AVAILABLE_MODELS or [])
+    if allowed_models and model not in allowed_models:
+        raise AISuggestionError(
+            f"Model '{model}' is not allowed. Configure OPENAI_AVAILABLE_MODELS to allow it."
+        )
+    return model
+
+
 def ai_suggestions_view(request):
     app_id = request.GET.get("app_id")
     if app_id:
@@ -937,6 +949,8 @@ def ai_suggestions_view(request):
         {
             "apps": apps,
             "selected_app": selected_app_id,
+            "available_models": settings.OPENAI_AVAILABLE_MODELS,
+            "default_model": settings.OPENAI_MODEL,
         },
     )
 
@@ -961,9 +975,11 @@ def ai_suggestions_generate_view(request):
     if not app_id:
         return JsonResponse({"error": "app_id is required."}, status=400)
     app = get_object_or_404(App, id=app_id)
+    model = body.get("model")
 
     try:
-        run = generate_ai_suggestions(app)
+        selected_model = _resolve_model_choice(model)
+        run = generate_ai_suggestions(app, model=selected_model)
     except AISuggestionError as exc:
         return JsonResponse({"error": str(exc)}, status=400)
     except Exception as exc:  # pragma: no cover - defensive runtime path
