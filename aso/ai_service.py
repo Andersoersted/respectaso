@@ -268,7 +268,6 @@ def _generate_candidates(
 
     response = client.chat.completions.create(
         model=model,
-        temperature=0.2,
         messages=[
             {
                 "role": "system",
@@ -395,6 +394,7 @@ def generate_ai_suggestions(
     *,
     model: str | None = None,
     api_key: str | None = None,
+    countries: list[str] | None = None,
     system_prompt: str | None = None,
     user_prompt_template: str | None = None,
     enable_online_context: bool | None = None,
@@ -424,7 +424,15 @@ def generate_ai_suggestions(
     )
     chosen_history_rows_max = max(50, min(5000, chosen_history_rows_max))
 
-    countries = _choose_countries(app)
+    if countries:
+        selected_countries = []
+        for raw in countries:
+            value = str(raw or "").strip().lower()
+            if value and value not in selected_countries:
+                selected_countries.append(value)
+        countries = selected_countries[: settings.AI_MAX_COUNTRIES]
+    if not countries:
+        countries = _choose_countries(app)
     online_context = {}
     if chosen_enable_online_context:
         online_context = _fetch_online_market_context(countries, chosen_online_top_apps)

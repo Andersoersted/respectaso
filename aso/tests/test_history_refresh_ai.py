@@ -258,6 +258,7 @@ class AISuggestionEndpointTests(TestCase):
             self.app,
             model="gpt-4.1-mini",
             api_key=ANY,
+            countries=["us"],
             system_prompt=ANY,
             user_prompt_template=ANY,
             enable_online_context=ANY,
@@ -274,6 +275,15 @@ class AISuggestionEndpointTests(TestCase):
         response = self.client.post(
             url,
             data='{"app_id": %d, "model": "gpt-4.1"}' % self.app.id,
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_generate_endpoint_rejects_invalid_country(self):
+        url = reverse("aso:ai_suggestions_generate")
+        response = self.client.post(
+            url,
+            data='{"app_id": %d, "model": "gpt-4.1-mini", "country": "xx-invalid"}' % self.app.id,
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 400)

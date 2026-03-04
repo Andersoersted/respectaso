@@ -23,6 +23,14 @@
                     {% endfor %}
                 </select>
             </div>
+            <div class="sm:w-56">
+                <label for="ai-country-select" class="block text-xs font-medium text-slate-300 mb-1.5">Country</label>
+                <select id="ai-country-select" class="w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500">
+                    {% for code, label in country_choices %}
+                    <option value="{{ code }}" {% if selected_country == code %}selected{% endif %}>{{ label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
             <div class="sm:w-64">
                 <label for="ai-model-select" class="block text-xs font-medium text-slate-300 mb-1.5">AI Model</label>
                 <select id="ai-model-select" class="w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500">
@@ -94,6 +102,7 @@
 <script>
 document.addEventListener('DOMContentLoaded', () => {
     const appSelect = document.getElementById('ai-app-select');
+    const countrySelect = document.getElementById('ai-country-select');
     const modelSelect = document.getElementById('ai-model-select');
     const generateBtn = document.getElementById('ai-generate-btn');
     const suggestionsBody = document.getElementById('ai-suggestions-body');
@@ -190,6 +199,7 @@ document.addEventListener('DOMContentLoaded', () => {
     async function generateSuggestions() {
         const appId = appSelect.value;
         if (!appId) return;
+        const country = countrySelect.value;
         const model = modelSelect.value;
         generateBtn.disabled = true;
         setStatus('Generating suggestions… This can take a while due to market analysis.', 'info');
@@ -197,7 +207,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const resp = await fetch('{% url "aso:ai_suggestions_generate" %}', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf},
-                body: JSON.stringify({app_id: Number(appId), model}),
+                body: JSON.stringify({app_id: Number(appId), model, country}),
             });
             const data = await resp.json();
             if (!resp.ok) throw new Error(data.error || 'Generation failed.');
@@ -229,12 +239,19 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    appSelect.addEventListener('change', () => {
+    function updateUrlAndReload() {
         const appId = appSelect.value;
-        const nextUrl = appId ? `?app=${encodeURIComponent(appId)}` : window.location.pathname;
+        const country = countrySelect.value;
+        const params = new URLSearchParams();
+        if (appId) params.set('app', appId);
+        if (country) params.set('country', country);
+        const nextUrl = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ''}`;
         history.replaceState(null, '', nextUrl);
         loadSuggestions();
-    });
+    }
+
+    appSelect.addEventListener('change', updateUrlAndReload);
+    countrySelect.addEventListener('change', updateUrlAndReload);
     generateBtn.addEventListener('click', generateSuggestions);
 
     suggestionsBody.addEventListener('click', (e) => {

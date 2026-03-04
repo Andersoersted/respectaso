@@ -948,6 +948,16 @@ def _get_app_by_id_param(app_id_raw):
     return App.objects.filter(id=app_id).first()
 
 
+def _resolve_country_choice(country_raw):
+    value = str(country_raw or "").strip().lower()
+    valid_codes = {code for code, _ in COUNTRY_CHOICES}
+    if not value:
+        return "us"
+    if value not in valid_codes:
+        raise AISuggestionError("Invalid country code for AI suggestion run.")
+    return value
+
+
 def _parse_csv_models(raw: str) -> list[str]:
     items = []
     for item in str(raw or "").split(","):
@@ -1031,10 +1041,15 @@ def ai_suggestions_view(request):
     apps = App.objects.all()
     effective = _effective_ai_settings()
     selected_app = request.GET.get("app")
+    selected_country_raw = request.GET.get("country")
     try:
         selected_app_id = int(selected_app) if selected_app else None
     except (TypeError, ValueError):
         selected_app_id = None
+    try:
+        selected_country = _resolve_country_choice(selected_country_raw)
+    except AISuggestionError:
+        selected_country = "us"
     return render(
         request,
         "aso/ai_suggestions.html",
@@ -1043,6 +1058,8 @@ def ai_suggestions_view(request):
             "selected_app": selected_app_id,
             "available_models": effective["available_models"],
             "default_model": effective["default_model"],
+            "country_choices": COUNTRY_CHOICES,
+            "selected_country": selected_country,
         },
     )
 
@@ -1068,9 +1085,11 @@ def ai_suggestions_generate_view(request):
         return JsonResponse({"error": "app_id is required."}, status=400)
     app = get_object_or_404(App, id=app_id)
     model = body.get("model")
+    country = body.get("country")
     effective = _effective_ai_settings()
 
     try:
+        selected_country = _resolve_country_choice(country)
         selected_model = _resolve_model_choice(
             model,
             default_model=effective["default_model"],
@@ -1080,6 +1099,7 @@ def ai_suggestions_generate_view(request):
             app,
             model=selected_model,
             api_key=effective["api_key"],
+            countries=[selected_country],
             system_prompt=effective["system_prompt"],
             user_prompt_template=effective["user_prompt_template"],
             enable_online_context=effective["enable_online_context"],
