@@ -397,6 +397,7 @@ class PromoRemovalTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotContains(response, "Track your keywords over time")
         self.assertNotContains(response, "Try Free →")
+        self.assertNotContains(response, "respectlytics.com/?utm_source=respectaso")
 
 
 class AppStoreConnectEndpointTests(TestCase):
