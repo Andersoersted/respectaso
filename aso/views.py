@@ -12,12 +12,35 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
 from .forms import AppForm, KeywordSearchForm, OpportunitySearchForm, RuntimeConfigForm, COUNTRY_CHOICES
-from .models import AISuggestion, AISuggestionRun, App, Keyword, RefreshRun, RuntimeConfig, SearchResult
+from .models import (
+    ASCMetricDaily,
+    ASCSyncRun,
+    AICopilotMetadataVariant,
+    AICopilotRecommendation,
+    AICopilotRun,
+    AISuggestion,
+    AISuggestionRun,
+    App,
+    Keyword,
+    RefreshRun,
+    RuntimeConfig,
+    SearchResult,
+)
 from .ai_service import (
     AISuggestionError,
     accept_ai_suggestion,
     generate_ai_suggestions,
     reject_ai_suggestion,
+)
+from .app_store_connect_service import ASCAPIError, ASCAuthError, ASCError, AppStoreConnectService
+from .copilot_ai_service import (
+    AICopilotError,
+    CopilotSettings,
+    accept_copilot_metadata_variant,
+    accept_copilot_recommendation,
+    generate_ai_copilot,
+    reject_copilot_metadata_variant,
+    reject_copilot_recommendation,
 )
 from .services import (
     DifficultyCalculator,
@@ -44,7 +67,7 @@ def setup_view(request):
 
 
 def config_view(request):
-    """In-app runtime configuration (OpenAI overrides + model list)."""
+    """In-app runtime configuration (OpenAI + App Store Connect overrides)."""
     runtime_config = RuntimeConfig.get_solo()
     saved = False
 
@@ -70,6 +93,9 @@ def config_view(request):
             "effective_online_context_enabled": effective["enable_online_context"],
             "effective_online_top_apps_per_country": effective["online_top_apps_per_country"],
             "effective_history_rows_max": effective["history_rows_max"],
+            "asc_configured": effective["asc_configured"],
+            "asc_key_source": effective["asc_key_source"],
+            "effective_asc_default_days_back": effective["asc_default_days_back"],
         },
     )
 
@@ -1016,6 +1042,115 @@ def _ai_payload_for_app(app: App):
     }
 
 
+def _serialize_copilot_recommendation(rec: AICopilotRecommendation):
+    evidence = rec.evidence_json or {}
+    return {
+        "id": rec.id,
+        "run_id": rec.run_id,
+        "app_id": rec.app_id,
+        "keyword": rec.keyword,
+        "action": rec.action,
+        "rationale": rec.rationale,
+        "llm_confidence": rec.llm_confidence,
+        "score_market": rec.score_market,
+        "score_rank_momentum": rec.score_rank_momentum,
+        "score_business_impact": rec.score_business_impact,
+        "score_coverage_gap": rec.score_coverage_gap,
+        "score_overall": rec.score_overall,
+        "status": rec.status,
+        "created_keyword_id": rec.created_keyword_id,
+        "created_at": rec.created_at.isoformat() if rec.created_at else None,
+        "resolved_at": rec.resolved_at.isoformat() if rec.resolved_at else None,
+        "evidence": evidence,
+    }
+
+
+def _serialize_copilot_metadata_variant(variant: AICopilotMetadataVariant):
+    return {
+        "id": variant.id,
+        "run_id": variant.run_id,
+        "app_id": variant.app_id,
+        "title": variant.title,
+        "subtitle": variant.subtitle,
+        "keyword_field": variant.keyword_field,
+        "covered_keywords": variant.covered_keywords_json or [],
+        "predicted_impact": variant.predicted_impact,
+        "rationale": variant.rationale,
+        "status": variant.status,
+        "created_at": variant.created_at.isoformat() if variant.created_at else None,
+        "resolved_at": variant.resolved_at.isoformat() if variant.resolved_at else None,
+    }
+
+
+def _serialize_asc_sync_run(run: ASCSyncRun | None):
+    if not run:
+        return None
+    return {
+        "id": run.id,
+        "status": run.status,
+        "days_back": run.days_back,
+        "rows_upserted": run.rows_upserted,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+        "error": run.error,
+    }
+
+
+def _asc_status_for_app(app: App):
+    latest_run = ASCSyncRun.objects.filter(app=app).order_by("-started_at").first()
+    latest_metric_date = (
+        ASCMetricDaily.objects.filter(app=app).order_by("-date").values_list("date", flat=True).first()
+    )
+    return {
+        "app_id": app.id,
+        "asc_app_id": app.asc_app_id,
+        "latest_run": _serialize_asc_sync_run(latest_run),
+        "metric_rows": ASCMetricDaily.objects.filter(app=app).count(),
+        "latest_metric_date": latest_metric_date.isoformat() if latest_metric_date else None,
+    }
+
+
+def _copilot_payload_for_app(app: App):
+    runs = list(
+        AICopilotRun.objects.filter(app=app)
+        .order_by("-started_at")[:20]
+        .values("id", "status", "model", "country", "started_at", "finished_at", "error")
+    )
+    recommendations_qs = (
+        AICopilotRecommendation.objects.filter(app=app)
+        .select_related("created_keyword", "run")
+        .order_by("-created_at")[:300]
+    )
+    variants_qs = (
+        AICopilotMetadataVariant.objects.filter(app=app)
+        .select_related("run")
+        .order_by("-created_at")[:50]
+    )
+    return {
+        "app": {
+            "id": app.id,
+            "name": app.name,
+            "track_id": app.track_id,
+            "asc_app_id": app.asc_app_id,
+        },
+        "runs": [
+            {
+                "id": row["id"],
+                "status": row["status"],
+                "model": row["model"],
+                "country": row["country"],
+                "started_at": row["started_at"].isoformat() if row["started_at"] else None,
+                "finished_at": row["finished_at"].isoformat() if row["finished_at"] else None,
+                "error": row["error"],
+            }
+            for row in runs
+        ],
+        "recommendations": [_serialize_copilot_recommendation(item) for item in recommendations_qs],
+        "metadata_variants": [_serialize_copilot_metadata_variant(item) for item in variants_qs],
+        "asc_status": _asc_status_for_app(app),
+    }
+
+
 def _get_app_by_id_param(app_id_raw):
     try:
         app_id = int(app_id_raw)
@@ -1030,7 +1165,7 @@ def _resolve_country_choice(country_raw):
     if not value:
         return "us"
     if value not in valid_codes:
-        raise AISuggestionError("Invalid country code for AI suggestion run.")
+        raise AISuggestionError("Invalid country code.")
     return value
 
 
@@ -1080,6 +1215,14 @@ def _effective_ai_settings() -> dict:
     elif settings.OPENAI_API_KEY:
         api_key_source = "env"
 
+    asc_issuer_id = runtime.asc_issuer_id.strip()
+    asc_key_id = runtime.asc_key_id.strip()
+    asc_private_key = runtime.asc_private_key_pem.strip()
+    asc_default_days_back = runtime.asc_default_days_back or settings.ASC_DEFAULT_DAYS_BACK
+    asc_default_days_back = max(1, min(365, int(asc_default_days_back)))
+    asc_configured = bool(asc_issuer_id and asc_key_id and asc_private_key)
+    asc_key_source = "config" if asc_configured else "none"
+
     return {
         "api_key": api_key,
         "default_model": default_model,
@@ -1090,6 +1233,12 @@ def _effective_ai_settings() -> dict:
         "enable_online_context": enable_online_context,
         "online_top_apps_per_country": online_top_apps_per_country,
         "history_rows_max": history_rows_max,
+        "asc_issuer_id": asc_issuer_id,
+        "asc_key_id": asc_key_id,
+        "asc_private_key": asc_private_key,
+        "asc_default_days_back": asc_default_days_back,
+        "asc_configured": asc_configured,
+        "asc_key_source": asc_key_source,
     }
 
 
@@ -1136,6 +1285,8 @@ def ai_suggestions_view(request):
             "default_model": effective["default_model"],
             "country_choices": COUNTRY_CHOICES,
             "selected_country": selected_country,
+            "asc_configured": effective["asc_configured"],
+            "asc_default_days_back": effective["asc_default_days_back"],
         },
     )
 
@@ -1218,6 +1369,223 @@ def ai_suggestion_reject_view(request, suggestion_id):
     suggestion = get_object_or_404(AISuggestion, id=suggestion_id)
     suggestion = reject_ai_suggestion(suggestion)
     return JsonResponse({"success": True, "suggestion": _serialize_ai_suggestion(suggestion)})
+
+
+def _build_asc_service(effective: dict):
+    return AppStoreConnectService(
+        issuer_id=effective["asc_issuer_id"],
+        key_id=effective["asc_key_id"],
+        private_key_pem=effective["asc_private_key"],
+    )
+
+
+@require_POST
+def app_store_connect_sync_view(request):
+    try:
+        body = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+    app_id = body.get("app_id")
+    if not app_id:
+        return JsonResponse({"error": "app_id is required."}, status=400)
+
+    app = get_object_or_404(App, id=app_id)
+    if not app.asc_app_id:
+        return JsonResponse({"error": "This app is missing asc_app_id."}, status=400)
+
+    effective = _effective_ai_settings()
+    if not effective["asc_configured"]:
+        return JsonResponse({"error": "App Store Connect credentials are not configured."}, status=400)
+
+    days_back_raw = body.get("days_back", effective["asc_default_days_back"])
+    try:
+        days_back = max(1, min(365, int(days_back_raw)))
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "days_back must be an integer between 1 and 365."}, status=400)
+
+    run = ASCSyncRun.objects.create(
+        app=app,
+        status=ASCSyncRun.STATUS_RUNNING,
+        days_back=days_back,
+        rows_upserted=0,
+    )
+    try:
+        service = _build_asc_service(effective)
+        rows_upserted = service.sync_app_metrics(app, days_back=days_back)
+        run.status = ASCSyncRun.STATUS_SUCCESS
+        run.rows_upserted = rows_upserted
+        run.finished_at = timezone.now()
+        run.error = ""
+        run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
+    except (ASCAuthError, ASCError, ASCAPIError) as exc:
+        run.status = ASCSyncRun.STATUS_FAILED
+        run.rows_upserted = 0
+        run.finished_at = timezone.now()
+        run.error = str(exc)
+        run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
+        return JsonResponse({"error": str(exc), "run": _serialize_asc_sync_run(run)}, status=400)
+    except Exception as exc:  # pragma: no cover - defensive runtime path
+        logger.exception("ASC sync failed")
+        run.status = ASCSyncRun.STATUS_FAILED
+        run.rows_upserted = 0
+        run.finished_at = timezone.now()
+        run.error = str(exc)
+        run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
+        return JsonResponse({"error": str(exc), "run": _serialize_asc_sync_run(run)}, status=500)
+
+    return JsonResponse(
+        {
+            "success": True,
+            "run": _serialize_asc_sync_run(run),
+            "rows_upserted": run.rows_upserted,
+            "status": _asc_status_for_app(app),
+        }
+    )
+
+
+def app_store_connect_status_view(request):
+    app_id = request.GET.get("app_id")
+    if not app_id:
+        return JsonResponse({"error": "app_id is required."}, status=400)
+    app = _get_app_by_id_param(app_id)
+    if not app:
+        return JsonResponse({"error": "Valid app_id is required."}, status=400)
+    effective = _effective_ai_settings()
+    payload = _asc_status_for_app(app)
+    payload["credentials_configured"] = effective["asc_configured"]
+    payload["key_source"] = effective["asc_key_source"]
+    return JsonResponse(payload)
+
+
+def ai_copilot_list_view(request):
+    app_id = request.GET.get("app_id")
+    if not app_id:
+        return JsonResponse({"error": "app_id is required."}, status=400)
+    app = _get_app_by_id_param(app_id)
+    if not app:
+        return JsonResponse({"error": "Valid app_id is required."}, status=400)
+    return JsonResponse(_copilot_payload_for_app(app))
+
+
+@require_POST
+def ai_copilot_generate_view(request):
+    try:
+        body = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+    app_id = body.get("app_id")
+    if not app_id:
+        return JsonResponse({"error": "app_id is required."}, status=400)
+    app = get_object_or_404(App, id=app_id)
+
+    country = body.get("country")
+    model = body.get("model")
+    sync_asc = bool(body.get("sync_asc", False))
+    effective = _effective_ai_settings()
+
+    try:
+        selected_country = _resolve_country_choice(country)
+        selected_model = _resolve_model_choice(
+            model,
+            default_model=effective["default_model"],
+            allowed_models=effective["available_models"],
+        )
+
+        asc_sync_payload = None
+        if sync_asc and app.asc_app_id and effective["asc_configured"]:
+            asc_run = ASCSyncRun.objects.create(
+                app=app,
+                status=ASCSyncRun.STATUS_RUNNING,
+                days_back=effective["asc_default_days_back"],
+                rows_upserted=0,
+            )
+            try:
+                asc_service = _build_asc_service(effective)
+                rows_upserted = asc_service.sync_app_metrics(app, days_back=effective["asc_default_days_back"])
+                asc_run.status = ASCSyncRun.STATUS_SUCCESS
+                asc_run.rows_upserted = rows_upserted
+                asc_run.finished_at = timezone.now()
+                asc_run.error = ""
+                asc_run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
+            except Exception as exc:
+                asc_run.status = ASCSyncRun.STATUS_FAILED
+                asc_run.rows_upserted = 0
+                asc_run.finished_at = timezone.now()
+                asc_run.error = str(exc)
+                asc_run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
+            asc_sync_payload = _serialize_asc_sync_run(asc_run)
+
+        run = generate_ai_copilot(
+            app,
+            country=selected_country,
+            settings_obj=CopilotSettings(
+                model=selected_model,
+                api_key=effective["api_key"],
+                system_prompt=effective["system_prompt"],
+                user_prompt_template=effective["user_prompt_template"],
+            ),
+        )
+    except (AISuggestionError, AICopilotError) as exc:
+        return JsonResponse({"error": str(exc)}, status=400)
+    except Exception as exc:  # pragma: no cover - defensive runtime path
+        logger.exception("AI copilot generation failed.")
+        return JsonResponse({"error": str(exc)}, status=500)
+
+    recommendations = [
+        _serialize_copilot_recommendation(item)
+        for item in run.recommendations.select_related("created_keyword").order_by("-score_overall")
+    ]
+    metadata_variants = [
+        _serialize_copilot_metadata_variant(item)
+        for item in run.metadata_variants.order_by("-predicted_impact")
+    ]
+    return JsonResponse(
+        {
+            "success": True,
+            "run": {
+                "id": run.id,
+                "status": run.status,
+                "model": run.model,
+                "country": run.country,
+                "started_at": run.started_at.isoformat() if run.started_at else None,
+                "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+                "error": run.error,
+            },
+            "recommendations": recommendations,
+            "metadata_variants": metadata_variants,
+            "asc_sync": asc_sync_payload,
+        }
+    )
+
+
+@require_POST
+def ai_copilot_recommendation_accept_view(request, recommendation_id):
+    recommendation = get_object_or_404(AICopilotRecommendation, id=recommendation_id)
+    recommendation = accept_copilot_recommendation(recommendation)
+    return JsonResponse({"success": True, "recommendation": _serialize_copilot_recommendation(recommendation)})
+
+
+@require_POST
+def ai_copilot_recommendation_reject_view(request, recommendation_id):
+    recommendation = get_object_or_404(AICopilotRecommendation, id=recommendation_id)
+    recommendation = reject_copilot_recommendation(recommendation)
+    return JsonResponse({"success": True, "recommendation": _serialize_copilot_recommendation(recommendation)})
+
+
+@require_POST
+def ai_copilot_metadata_accept_view(request, variant_id):
+    variant = get_object_or_404(AICopilotMetadataVariant, id=variant_id)
+    variant = accept_copilot_metadata_variant(variant)
+    return JsonResponse({"success": True, "metadata_variant": _serialize_copilot_metadata_variant(variant)})
+
+
+@require_POST
+def ai_copilot_metadata_reject_view(request, variant_id):
+    variant = get_object_or_404(AICopilotMetadataVariant, id=variant_id)
+    variant = reject_copilot_metadata_variant(variant)
+    return JsonResponse({"success": True, "metadata_variant": _serialize_copilot_metadata_variant(variant)})
 
 
 def version_check_view(request):

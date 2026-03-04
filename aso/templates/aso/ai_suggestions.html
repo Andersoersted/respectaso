@@ -1,29 +1,29 @@
 {% extends "aso/base.html" %}
 
-{% block title %}AI Suggestions — RespectASO{% endblock %}
+{% block title %}AI Copilot — RespectASO{% endblock %}
 
 {% block content %}
-<div class="max-w-6xl mx-auto space-y-5">
+<div class="max-w-7xl mx-auto space-y-5">
     <form class="hidden">{% csrf_token %}</form>
     <div>
-        <h1 class="text-xl font-bold text-white">AI Keyword Suggestions</h1>
+        <h1 class="text-xl font-bold text-white">AI Copilot</h1>
         <p class="text-slate-400 text-sm mt-0.5">
-            Apple App Store only. Generate draft keywords based on app metadata, current market, and your historical trends.
+            On-demand ASO copilot using tracked keyword history + App Store Connect analytics + OpenAI structured outputs.
         </p>
     </div>
 
     <div class="bg-[#1e293b] border border-white/10 rounded-xl p-4">
-        <div class="flex flex-col sm:flex-row gap-3 sm:items-end">
-            <div class="flex-1">
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+            <div class="md:col-span-1">
                 <label for="ai-app-select" class="block text-xs font-medium text-slate-300 mb-1.5">App</label>
                 <select id="ai-app-select" class="w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500">
-                    <option value="">Select an app…</option>
+                    <option value="">Select an app...</option>
                     {% for app in apps %}
                     <option value="{{ app.id }}" {% if selected_app == app.id %}selected{% endif %}>{{ app.name }}</option>
                     {% endfor %}
                 </select>
             </div>
-            <div class="sm:w-56">
+            <div class="md:col-span-1">
                 <label for="ai-country-select" class="block text-xs font-medium text-slate-300 mb-1.5">Country</label>
                 <select id="ai-country-select" class="w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500">
                     {% for code, label in country_choices %}
@@ -31,7 +31,7 @@
                     {% endfor %}
                 </select>
             </div>
-            <div class="sm:w-64">
+            <div class="md:col-span-1">
                 <label for="ai-model-select" class="block text-xs font-medium text-slate-300 mb-1.5">AI Model</label>
                 <select id="ai-model-select" class="w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500">
                     {% for model in available_models %}
@@ -39,37 +39,78 @@
                     {% endfor %}
                 </select>
             </div>
-            <button id="ai-generate-btn"
-                    class="bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium px-4 py-2.5 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    disabled>
-                Generate Suggestions
-            </button>
+            <div class="md:col-span-1 flex items-end gap-2">
+                <button id="asc-sync-btn"
+                        class="flex-1 bg-cyan-600/20 hover:bg-cyan-600/30 text-cyan-300 text-sm font-medium px-3 py-2.5 rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        disabled>
+                    Sync ASC
+                </button>
+                <button id="ai-generate-btn"
+                        class="flex-1 bg-purple-600 hover:bg-purple-700 text-white text-sm font-medium px-3 py-2.5 rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        disabled>
+                    Run Copilot
+                </button>
+            </div>
         </div>
-        <p class="text-xs text-slate-500 mt-2">The selected app must be linked from App Store lookup (track_id required).</p>
+        <div class="mt-2 flex items-center gap-2 text-xs text-slate-500">
+            <span>ASC credentials:</span>
+            {% if asc_configured %}
+            <span class="text-green-300">Configured</span>
+            {% else %}
+            <span class="text-red-300">Missing (set in Config)</span>
+            {% endif %}
+            <span>·</span>
+            <span>Default ASC sync window: {{ asc_default_days_back }} days</span>
+        </div>
     </div>
 
-    <div id="ai-run-status" class="hidden bg-slate-800/50 border border-white/10 rounded-xl p-3 text-sm"></div>
+    <div id="ai-status" class="hidden bg-slate-800/50 border border-white/10 rounded-xl p-3 text-sm text-slate-200"></div>
+
+    <div class="bg-[#1e293b] border border-white/10 rounded-xl overflow-hidden">
+        <div class="px-4 py-3 border-b border-white/10 flex items-center justify-between">
+            <h2 class="text-base font-semibold text-white">App Store Connect Status</h2>
+            <span id="asc-summary" class="text-xs text-slate-500">Select an app.</span>
+        </div>
+        <div class="p-4">
+            <div id="asc-status-grid" class="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+                <div class="bg-slate-800/60 border border-white/5 rounded-lg p-3">
+                    <p class="text-slate-500 mb-1">Latest Sync</p>
+                    <p id="asc-latest-sync" class="text-slate-300">-</p>
+                </div>
+                <div class="bg-slate-800/60 border border-white/5 rounded-lg p-3">
+                    <p class="text-slate-500 mb-1">Rows Stored</p>
+                    <p id="asc-rows" class="text-slate-300">-</p>
+                </div>
+                <div class="bg-slate-800/60 border border-white/5 rounded-lg p-3">
+                    <p class="text-slate-500 mb-1">Latest Metric Date</p>
+                    <p id="asc-latest-date" class="text-slate-300">-</p>
+                </div>
+            </div>
+        </div>
+    </div>
 
     <div class="bg-[#1e293b] border border-white/10 rounded-xl overflow-hidden">
         <div class="px-4 py-3 border-b border-white/10">
-            <h2 class="text-base font-semibold text-white">Draft Suggestions</h2>
+            <h2 class="text-base font-semibold text-white">Keyword Recommendations</h2>
         </div>
         <div class="overflow-x-auto">
             <table class="w-full">
                 <thead>
                     <tr class="border-b border-white/10">
                         <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Keyword</th>
-                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Intent</th>
+                        <th class="px-3 py-2 text-center text-xs font-medium text-slate-400">Action</th>
                         <th class="px-3 py-2 text-center text-xs font-medium text-slate-400">Overall</th>
                         <th class="px-3 py-2 text-center text-xs font-medium text-slate-400">Market</th>
-                        <th class="px-3 py-2 text-center text-xs font-medium text-slate-400">Confidence</th>
-                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Countries</th>
+                        <th class="px-3 py-2 text-center text-xs font-medium text-slate-400">Rank</th>
+                        <th class="px-3 py-2 text-center text-xs font-medium text-slate-400">Business</th>
+                        <th class="px-3 py-2 text-center text-xs font-medium text-slate-400">Coverage</th>
+                        <th class="px-3 py-2 text-center text-xs font-medium text-slate-400">LLM</th>
                         <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Rationale</th>
                         <th class="px-3 py-2 text-right text-xs font-medium text-slate-400">Actions</th>
                     </tr>
                 </thead>
-                <tbody id="ai-suggestions-body">
-                    <tr><td colspan="8" class="px-3 py-5 text-sm text-slate-500 text-center">Select an app to load suggestions.</td></tr>
+                <tbody id="copilot-recommendations-body">
+                    <tr><td colspan="10" class="px-3 py-5 text-sm text-slate-500 text-center">Select an app to load recommendations.</td></tr>
                 </tbody>
             </table>
         </div>
@@ -77,7 +118,30 @@
 
     <div class="bg-[#1e293b] border border-white/10 rounded-xl overflow-hidden">
         <div class="px-4 py-3 border-b border-white/10">
-            <h2 class="text-base font-semibold text-white">Recent Runs</h2>
+            <h2 class="text-base font-semibold text-white">Metadata Variants</h2>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full">
+                <thead>
+                    <tr class="border-b border-white/10">
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Title</th>
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Subtitle</th>
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Keyword Field</th>
+                        <th class="px-3 py-2 text-center text-xs font-medium text-slate-400">Impact</th>
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Covered Keywords</th>
+                        <th class="px-3 py-2 text-right text-xs font-medium text-slate-400">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="copilot-metadata-body">
+                    <tr><td colspan="6" class="px-3 py-5 text-sm text-slate-500 text-center">No metadata variants yet.</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="bg-[#1e293b] border border-white/10 rounded-xl overflow-hidden">
+        <div class="px-4 py-3 border-b border-white/10">
+            <h2 class="text-base font-semibold text-white">Recent Copilot Runs</h2>
         </div>
         <div class="overflow-x-auto">
             <table class="w-full">
@@ -86,12 +150,12 @@
                         <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Run</th>
                         <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Status</th>
                         <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Model</th>
-                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Countries</th>
+                        <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Country</th>
                         <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Started</th>
                         <th class="px-3 py-2 text-left text-xs font-medium text-slate-400">Error</th>
                     </tr>
                 </thead>
-                <tbody id="ai-runs-body">
+                <tbody id="copilot-runs-body">
                     <tr><td colspan="6" class="px-3 py-5 text-sm text-slate-500 text-center">No runs yet.</td></tr>
                 </tbody>
             </table>
@@ -104,54 +168,102 @@ document.addEventListener('DOMContentLoaded', () => {
     const appSelect = document.getElementById('ai-app-select');
     const countrySelect = document.getElementById('ai-country-select');
     const modelSelect = document.getElementById('ai-model-select');
+    const syncBtn = document.getElementById('asc-sync-btn');
     const generateBtn = document.getElementById('ai-generate-btn');
-    const suggestionsBody = document.getElementById('ai-suggestions-body');
-    const runsBody = document.getElementById('ai-runs-body');
-    const runStatus = document.getElementById('ai-run-status');
+    const statusEl = document.getElementById('ai-status');
+    const recoBody = document.getElementById('copilot-recommendations-body');
+    const metadataBody = document.getElementById('copilot-metadata-body');
+    const runsBody = document.getElementById('copilot-runs-body');
     const csrf = document.querySelector('[name=csrfmiddlewaretoken]')?.value || '';
 
-    function setStatus(msg, type='info') {
-        runStatus.classList.remove('hidden');
-        runStatus.className = 'bg-slate-800/50 border border-white/10 rounded-xl p-3 text-sm';
-        if (type === 'error') runStatus.classList.add('text-red-300', 'border-red-500/30', 'bg-red-900/20');
-        else if (type === 'success') runStatus.classList.add('text-green-300', 'border-green-500/30', 'bg-green-900/20');
-        else runStatus.classList.add('text-slate-300');
-        runStatus.textContent = msg;
+    const ascSummary = document.getElementById('asc-summary');
+    const ascLatestSync = document.getElementById('asc-latest-sync');
+    const ascRows = document.getElementById('asc-rows');
+    const ascLatestDate = document.getElementById('asc-latest-date');
+
+    function fmtPct(value) {
+        return `${Math.round((Number(value || 0)) * 100)}%`;
     }
 
-    function fmtPct(x) {
-        return Math.round((Number(x || 0) * 100)) + '%';
+    function setStatus(message, type = 'info') {
+        statusEl.classList.remove('hidden');
+        statusEl.className = 'bg-slate-800/50 border border-white/10 rounded-xl p-3 text-sm';
+        if (type === 'error') statusEl.classList.add('text-red-300', 'border-red-500/30', 'bg-red-900/20');
+        else if (type === 'success') statusEl.classList.add('text-green-300', 'border-green-500/30', 'bg-green-900/20');
+        else statusEl.classList.add('text-slate-200');
+        statusEl.textContent = message;
     }
 
-    function renderSuggestions(suggestions) {
-        if (!suggestions || suggestions.length === 0) {
-            suggestionsBody.innerHTML = '<tr><td colspan="8" class="px-3 py-5 text-sm text-slate-500 text-center">No suggestions yet.</td></tr>';
+    function recommendationActionChip(action) {
+        const v = String(action || '').toLowerCase();
+        if (v === 'promote') return '<span class="px-2 py-0.5 rounded bg-green-900/30 text-green-300 text-[11px]">Promote</span>';
+        if (v === 'add') return '<span class="px-2 py-0.5 rounded bg-emerald-900/30 text-emerald-300 text-[11px]">Add</span>';
+        if (v === 'deprioritize') return '<span class="px-2 py-0.5 rounded bg-red-900/30 text-red-300 text-[11px]">Deprioritize</span>';
+        return '<span class="px-2 py-0.5 rounded bg-slate-700 text-slate-300 text-[11px]">Watch</span>';
+    }
+
+    function renderRecommendations(recommendations) {
+        if (!recommendations || recommendations.length === 0) {
+            recoBody.innerHTML = '<tr><td colspan="10" class="px-3 py-5 text-sm text-slate-500 text-center">No recommendations yet.</td></tr>';
             return;
         }
-        suggestionsBody.innerHTML = suggestions.map((s) => {
-            const countries = (s.countries || []).map((c) =>
-                `${String(c.country || '').toUpperCase()}: P${c.popularity ?? '—'} / D${c.difficulty ?? '—'} / O${c.opportunity ?? '—'}`
-            ).join('<br>');
-            const statusChip = s.status === 'accepted'
+        recoBody.innerHTML = recommendations.map((r) => {
+            const status = r.status === 'accepted'
                 ? '<span class="text-green-300">Accepted</span>'
-                : s.status === 'rejected'
+                : r.status === 'rejected'
                     ? '<span class="text-red-300">Rejected</span>'
                     : '<span class="text-yellow-300">Draft</span>';
             return `
                 <tr class="border-b border-white/5 align-top">
-                    <td class="px-3 py-2 text-sm text-white font-medium">${s.keyword}</td>
-                    <td class="px-3 py-2 text-xs text-slate-300">${s.intent || '—'}</td>
-                    <td class="px-3 py-2 text-xs text-center text-purple-300">${fmtPct(s.score_overall)}</td>
-                    <td class="px-3 py-2 text-xs text-center text-sky-300">${fmtPct(s.score_market)}</td>
-                    <td class="px-3 py-2 text-xs text-center text-emerald-300">${fmtPct(s.confidence)}</td>
-                    <td class="px-3 py-2 text-[11px] text-slate-300 whitespace-nowrap">${countries || '—'}</td>
-                    <td class="px-3 py-2 text-xs text-slate-300 max-w-md">${s.rationale || '—'}</td>
+                    <td class="px-3 py-2 text-sm text-white font-medium">${r.keyword}</td>
+                    <td class="px-3 py-2 text-center">${recommendationActionChip(r.action)}</td>
+                    <td class="px-3 py-2 text-center text-xs text-purple-300">${fmtPct(r.score_overall)}</td>
+                    <td class="px-3 py-2 text-center text-xs text-sky-300">${fmtPct(r.score_market)}</td>
+                    <td class="px-3 py-2 text-center text-xs text-cyan-300">${fmtPct(r.score_rank_momentum)}</td>
+                    <td class="px-3 py-2 text-center text-xs text-emerald-300">${fmtPct(r.score_business_impact)}</td>
+                    <td class="px-3 py-2 text-center text-xs text-orange-300">${fmtPct(r.score_coverage_gap)}</td>
+                    <td class="px-3 py-2 text-center text-xs text-slate-300">${fmtPct(r.llm_confidence)}</td>
+                    <td class="px-3 py-2 text-xs text-slate-300 max-w-md">${r.rationale || '—'}</td>
                     <td class="px-3 py-2 text-right text-xs">
                         <div class="space-y-1">
-                            <div>${statusChip}</div>
-                            ${s.status === 'draft' ? `
-                            <button data-action="accept" data-id="${s.id}" class="ai-action bg-green-600/20 hover:bg-green-600/30 text-green-300 px-2 py-1 rounded mr-1">Accept</button>
-                            <button data-action="reject" data-id="${s.id}" class="ai-action bg-red-600/20 hover:bg-red-600/30 text-red-300 px-2 py-1 rounded">Reject</button>
+                            <div>${status}</div>
+                            ${r.status === 'draft' ? `
+                            <button data-kind="recommendation" data-action="accept" data-id="${r.id}" class="copilot-action bg-green-600/20 hover:bg-green-600/30 text-green-300 px-2 py-1 rounded mr-1">Accept</button>
+                            <button data-kind="recommendation" data-action="reject" data-id="${r.id}" class="copilot-action bg-red-600/20 hover:bg-red-600/30 text-red-300 px-2 py-1 rounded">Reject</button>
+                            ` : ''}
+                        </div>
+                    </td>
+                </tr>`;
+        }).join('');
+    }
+
+    function renderMetadataVariants(variants) {
+        if (!variants || variants.length === 0) {
+            metadataBody.innerHTML = '<tr><td colspan="6" class="px-3 py-5 text-sm text-slate-500 text-center">No metadata variants yet.</td></tr>';
+            return;
+        }
+        metadataBody.innerHTML = variants.map((v) => {
+            const status = v.status === 'accepted'
+                ? '<span class="text-green-300">Accepted</span>'
+                : v.status === 'rejected'
+                    ? '<span class="text-red-300">Rejected</span>'
+                    : '<span class="text-yellow-300">Draft</span>';
+            const titleLen = (v.title || '').length;
+            const subtitleLen = (v.subtitle || '').length;
+            const keywordLen = (v.keyword_field || '').length;
+            return `
+                <tr class="border-b border-white/5 align-top">
+                    <td class="px-3 py-2 text-xs text-white font-medium">${v.title || '—'} <span class="text-slate-500">(${titleLen}/30)</span></td>
+                    <td class="px-3 py-2 text-xs text-slate-300">${v.subtitle || '—'} <span class="text-slate-500">(${subtitleLen}/30)</span></td>
+                    <td class="px-3 py-2 text-xs text-slate-300">${v.keyword_field || '—'} <span class="text-slate-500">(${keywordLen}/100)</span></td>
+                    <td class="px-3 py-2 text-xs text-center text-purple-300">${fmtPct(v.predicted_impact)}</td>
+                    <td class="px-3 py-2 text-xs text-slate-300">${(v.covered_keywords || []).join(', ') || '—'}</td>
+                    <td class="px-3 py-2 text-right text-xs">
+                        <div class="space-y-1">
+                            <div>${status}</div>
+                            ${v.status === 'draft' ? `
+                            <button data-kind="metadata" data-action="accept" data-id="${v.id}" class="copilot-action bg-green-600/20 hover:bg-green-600/30 text-green-300 px-2 py-1 rounded mr-1">Accept</button>
+                            <button data-kind="metadata" data-action="reject" data-id="${v.id}" class="copilot-action bg-red-600/20 hover:bg-red-600/30 text-red-300 px-2 py-1 rounded">Reject</button>
                             ` : ''}
                         </div>
                     </td>
@@ -169,62 +281,121 @@ document.addEventListener('DOMContentLoaded', () => {
                 <td class="px-3 py-2 text-xs text-slate-300">#${run.id}</td>
                 <td class="px-3 py-2 text-xs text-slate-300">${run.status}</td>
                 <td class="px-3 py-2 text-xs text-slate-300">${run.model}</td>
-                <td class="px-3 py-2 text-xs text-slate-300">${(run.countries || []).map(c => String(c).toUpperCase()).join(', ') || '—'}</td>
+                <td class="px-3 py-2 text-xs text-slate-300">${String(run.country || '').toUpperCase()}</td>
                 <td class="px-3 py-2 text-xs text-slate-300">${run.started_at ? new Date(run.started_at).toLocaleString() : '—'}</td>
                 <td class="px-3 py-2 text-xs text-red-300">${run.error || '—'}</td>
             </tr>
         `).join('');
     }
 
-    async function loadSuggestions() {
+    function renderASCStatus(status) {
+        if (!status) {
+            ascSummary.textContent = 'No status.';
+            ascLatestSync.textContent = '-';
+            ascRows.textContent = '-';
+            ascLatestDate.textContent = '-';
+            return;
+        }
+        const run = status.latest_run || null;
+        ascSummary.textContent = run
+            ? `Latest run: ${run.status} (${run.rows_upserted} row(s))`
+            : 'No sync runs yet.';
+        ascLatestSync.textContent = run && run.started_at ? new Date(run.started_at).toLocaleString() : '-';
+        ascRows.textContent = String(status.metric_rows ?? 0);
+        ascLatestDate.textContent = status.latest_metric_date || '-';
+    }
+
+    async function loadCopilotData() {
         const appId = appSelect.value;
         generateBtn.disabled = !appId;
+        syncBtn.disabled = !appId;
         if (!appId) {
-            renderSuggestions([]);
+            renderRecommendations([]);
+            renderMetadataVariants([]);
             renderRuns([]);
+            renderASCStatus(null);
             return;
         }
         try {
-            const resp = await fetch(`{% url "aso:ai_suggestions" %}?app_id=${encodeURIComponent(appId)}`);
+            const resp = await fetch(`{% url "aso:ai_copilot_list" %}?app_id=${encodeURIComponent(appId)}`);
             const data = await resp.json();
-            if (!resp.ok) throw new Error(data.error || 'Failed to load suggestions.');
-            renderSuggestions(data.suggestions || []);
+            if (!resp.ok) throw new Error(data.error || 'Failed to load copilot data.');
+            renderRecommendations(data.recommendations || []);
+            renderMetadataVariants(data.metadata_variants || []);
             renderRuns(data.runs || []);
-            setStatus(`Loaded AI data for ${data.app.name}.`, 'info');
+            renderASCStatus(data.asc_status || null);
+            setStatus(`Loaded copilot data for ${data.app?.name || 'app'}.`, 'info');
         } catch (err) {
-            setStatus(err.message || 'Failed to load AI data.', 'error');
+            setStatus(err.message || 'Failed to load copilot data.', 'error');
         }
     }
 
-    async function generateSuggestions() {
+    async function runCopilot() {
         const appId = appSelect.value;
         if (!appId) return;
-        const country = countrySelect.value;
-        const model = modelSelect.value;
         generateBtn.disabled = true;
-        setStatus('Generating suggestions… This can take a while due to market analysis.', 'info');
+        syncBtn.disabled = true;
+        setStatus('Running AI Copilot. This may take a while.', 'info');
         try {
-            const resp = await fetch('{% url "aso:ai_suggestions_generate" %}', {
+            const resp = await fetch('{% url "aso:ai_copilot_generate" %}', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf},
-                body: JSON.stringify({app_id: Number(appId), model, country}),
+                body: JSON.stringify({
+                    app_id: Number(appId),
+                    model: modelSelect.value,
+                    country: countrySelect.value,
+                    sync_asc: false,
+                }),
             });
             const data = await resp.json();
-            if (!resp.ok) throw new Error(data.error || 'Generation failed.');
-            setStatus(`Generated ${data.suggestions.length} draft suggestions.`, 'success');
-            renderSuggestions(data.suggestions || []);
-            await loadSuggestions();
+            if (!resp.ok) throw new Error(data.error || 'Copilot generation failed.');
+            renderRecommendations(data.recommendations || []);
+            renderMetadataVariants(data.metadata_variants || []);
+            await loadCopilotData();
+            setStatus(`Copilot generated ${data.recommendations?.length || 0} recommendations.`, 'success');
         } catch (err) {
-            setStatus(err.message || 'Generation failed.', 'error');
+            setStatus(err.message || 'Copilot generation failed.', 'error');
         } finally {
             generateBtn.disabled = !appSelect.value;
+            syncBtn.disabled = !appSelect.value;
         }
     }
 
-    async function updateSuggestion(action, suggestionId) {
-        const url = action === 'accept'
-            ? `{% url "aso:ai_suggestion_accept" 0 %}`.replace('/0/', `/${suggestionId}/`)
-            : `{% url "aso:ai_suggestion_reject" 0 %}`.replace('/0/', `/${suggestionId}/`);
+    async function syncASC() {
+        const appId = appSelect.value;
+        if (!appId) return;
+        generateBtn.disabled = true;
+        syncBtn.disabled = true;
+        setStatus('Syncing App Store Connect data...', 'info');
+        try {
+            const resp = await fetch('{% url "aso:app_store_connect_sync" %}', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf},
+                body: JSON.stringify({app_id: Number(appId)}),
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.error || 'ASC sync failed.');
+            renderASCStatus(data.status || null);
+            setStatus(`ASC sync completed (${data.rows_upserted || 0} row(s)).`, 'success');
+        } catch (err) {
+            setStatus(err.message || 'ASC sync failed.', 'error');
+        } finally {
+            generateBtn.disabled = !appSelect.value;
+            syncBtn.disabled = !appSelect.value;
+        }
+    }
+
+    async function updateEntity(kind, action, entityId) {
+        let url = '';
+        if (kind === 'recommendation') {
+            url = action === 'accept'
+                ? `{% url "aso:ai_copilot_recommendation_accept" 0 %}`.replace('/0/', `/${entityId}/`)
+                : `{% url "aso:ai_copilot_recommendation_reject" 0 %}`.replace('/0/', `/${entityId}/`);
+        } else {
+            url = action === 'accept'
+                ? `{% url "aso:ai_copilot_metadata_accept" 0 %}`.replace('/0/', `/${entityId}/`)
+                : `{% url "aso:ai_copilot_metadata_reject" 0 %}`.replace('/0/', `/${entityId}/`);
+        }
         try {
             const resp = await fetch(url, {
                 method: 'POST',
@@ -232,35 +403,43 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const data = await resp.json();
             if (!resp.ok) throw new Error(data.error || 'Action failed.');
-            setStatus(`Suggestion "${data.suggestion.keyword}" marked as ${data.suggestion.status}.`, 'success');
-            await loadSuggestions();
+            setStatus(`${kind} updated: ${action}.`, 'success');
+            await loadCopilotData();
         } catch (err) {
-            setStatus(err.message || 'Failed to update suggestion.', 'error');
+            setStatus(err.message || 'Action failed.', 'error');
         }
     }
 
-    function updateUrlAndReload() {
-        const appId = appSelect.value;
-        const country = countrySelect.value;
+    function syncUrlFromSelection() {
         const params = new URLSearchParams();
-        if (appId) params.set('app', appId);
-        if (country) params.set('country', country);
-        const nextUrl = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ''}`;
-        history.replaceState(null, '', nextUrl);
-        loadSuggestions();
+        if (appSelect.value) params.set('app', appSelect.value);
+        if (countrySelect.value) params.set('country', countrySelect.value);
+        const next = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ''}`;
+        history.replaceState(null, '', next);
     }
 
-    appSelect.addEventListener('change', updateUrlAndReload);
-    countrySelect.addEventListener('change', updateUrlAndReload);
-    generateBtn.addEventListener('click', generateSuggestions);
+    appSelect.addEventListener('change', () => {
+        syncUrlFromSelection();
+        loadCopilotData();
+    });
+    countrySelect.addEventListener('change', () => {
+        syncUrlFromSelection();
+    });
+    generateBtn.addEventListener('click', runCopilot);
+    syncBtn.addEventListener('click', syncASC);
 
-    suggestionsBody.addEventListener('click', (e) => {
-        const btn = e.target.closest('.ai-action');
+    recoBody.addEventListener('click', (e) => {
+        const btn = e.target.closest('.copilot-action');
         if (!btn) return;
-        updateSuggestion(btn.dataset.action, btn.dataset.id);
+        updateEntity(btn.dataset.kind, btn.dataset.action, btn.dataset.id);
+    });
+    metadataBody.addEventListener('click', (e) => {
+        const btn = e.target.closest('.copilot-action');
+        if (!btn) return;
+        updateEntity(btn.dataset.kind, btn.dataset.action, btn.dataset.id);
     });
 
-    loadSuggestions();
+    loadCopilotData();
 });
 </script>
 {% endblock %}

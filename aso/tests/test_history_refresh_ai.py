@@ -9,7 +9,20 @@ from django.urls import reverse
 from django.utils import timezone
 
 from aso.ai_service import AISuggestionError, accept_ai_suggestion, generate_ai_suggestions
-from aso.models import AISuggestion, AISuggestionRun, App, Keyword, RefreshRun, RuntimeConfig, SearchResult
+from aso.models import (
+    ASCMetricDaily,
+    ASCSyncRun,
+    AICopilotMetadataVariant,
+    AICopilotRecommendation,
+    AICopilotRun,
+    AISuggestion,
+    AISuggestionRun,
+    App,
+    Keyword,
+    RefreshRun,
+    RuntimeConfig,
+    SearchResult,
+)
 from aso.refresh_service import cleanup_old_results
 
 
@@ -299,7 +312,7 @@ class AISuggestionEndpointTests(TestCase):
     def test_suggestions_page_renders_without_app_id(self):
         response = self.client.get(reverse("aso:ai_suggestions"))
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "AI Keyword Suggestions")
+        self.assertContains(response, "AI Copilot")
 
     def test_list_endpoint_rejects_invalid_app_id(self):
         response = self.client.get(reverse("aso:ai_suggestions"), {"app_id": "not-an-int"})
@@ -376,3 +389,169 @@ class DashboardServerSortTests(TestCase):
         self.assertEqual(len(rows), 5)
         self.assertEqual(rows[0].popularity_score, 26)
         self.assertEqual(rows[-1].popularity_score, 30)
+
+
+class PromoRemovalTests(TestCase):
+    def test_dashboard_has_no_top_banner_or_footer_cta(self):
+        response = self.client.get(reverse("aso:dashboard"))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "Track your keywords over time")
+        self.assertNotContains(response, "Try Free →")
+
+
+class AppStoreConnectEndpointTests(TestCase):
+    def setUp(self):
+        self.app = App.objects.create(name="ASC App", track_id=101010, asc_app_id="1234567890")
+        cfg = RuntimeConfig.get_solo()
+        cfg.asc_issuer_id = "issuer-id"
+        cfg.asc_key_id = "key-id"
+        cfg.asc_private_key_pem = "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"
+        cfg.asc_default_days_back = 30
+        cfg.save()
+
+    def test_status_endpoint_requires_app_id(self):
+        response = self.client.get(reverse("aso:app_store_connect_status"))
+        self.assertEqual(response.status_code, 400)
+
+    def test_status_endpoint_returns_payload(self):
+        ASCMetricDaily.objects.create(
+            app=self.app,
+            date=timezone.now().date(),
+            country="us",
+            impressions=100,
+            product_page_views=80,
+            app_units=20,
+            conversion_rate=25.0,
+        )
+        response = self.client.get(reverse("aso:app_store_connect_status"), {"app_id": self.app.id})
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["app_id"], self.app.id)
+        self.assertEqual(payload["metric_rows"], 1)
+
+    @patch("aso.views.AppStoreConnectService.sync_app_metrics")
+    def test_sync_endpoint_creates_run(self, mock_sync):
+        mock_sync.return_value = 7
+        response = self.client.post(
+            reverse("aso:app_store_connect_sync"),
+            data=json.dumps({"app_id": self.app.id, "days_back": 14}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["rows_upserted"], 7)
+        run = ASCSyncRun.objects.first()
+        self.assertIsNotNone(run)
+        self.assertEqual(run.status, ASCSyncRun.STATUS_SUCCESS)
+
+    def test_sync_endpoint_rejects_missing_asc_app_id(self):
+        app = App.objects.create(name="No ASC", track_id=202020, asc_app_id="")
+        response = self.client.post(
+            reverse("aso:app_store_connect_sync"),
+            data=json.dumps({"app_id": app.id}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+
+class AICopilotEndpointTests(TestCase):
+    def setUp(self):
+        self.app = App.objects.create(name="Copilot App", track_id=303030, asc_app_id="999")
+        self.run = AICopilotRun.objects.create(
+            app=self.app,
+            status=AICopilotRun.STATUS_SUCCESS,
+            model="gpt-5-mini",
+            country="us",
+            input_snapshot_json={},
+            feature_summary_json={},
+        )
+        self.recommendation = AICopilotRecommendation.objects.create(
+            run=self.run,
+            app=self.app,
+            keyword="copilot keyword",
+            action=AICopilotRecommendation.ACTION_ADD,
+            rationale="good candidate",
+            llm_confidence=0.7,
+            score_market=0.6,
+            score_rank_momentum=0.5,
+            score_business_impact=0.4,
+            score_coverage_gap=0.8,
+            score_overall=0.62,
+            evidence_json={"country": "us"},
+        )
+        self.variant = AICopilotMetadataVariant.objects.create(
+            run=self.run,
+            app=self.app,
+            title="Copilot Title",
+            subtitle="Subtitle",
+            keyword_field="copilot,keyword",
+            covered_keywords_json=["copilot keyword"],
+            predicted_impact=0.66,
+        )
+
+    def test_list_endpoint_returns_copilot_payload(self):
+        response = self.client.get(reverse("aso:ai_copilot_list"), {"app_id": self.app.id})
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["app"]["id"], self.app.id)
+        self.assertGreaterEqual(len(payload["recommendations"]), 1)
+        self.assertGreaterEqual(len(payload["metadata_variants"]), 1)
+
+    @patch("aso.views.generate_ai_copilot")
+    def test_generate_endpoint_returns_run_payload(self, mock_generate):
+        mock_generate.return_value = self.run
+        response = self.client.post(
+            reverse("aso:ai_copilot_generate"),
+            data=json.dumps({"app_id": self.app.id, "country": "us", "model": "gpt-5-mini"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["run"]["id"], self.run.id)
+
+    def test_recommendation_accept_and_reject_endpoints(self):
+        accept_resp = self.client.post(
+            reverse("aso:ai_copilot_recommendation_accept", args=[self.recommendation.id])
+        )
+        self.assertEqual(accept_resp.status_code, 200)
+        self.recommendation.refresh_from_db()
+        self.assertEqual(self.recommendation.status, AICopilotRecommendation.STATUS_ACCEPTED)
+
+        draft = AICopilotRecommendation.objects.create(
+            run=self.run,
+            app=self.app,
+            keyword="reject me",
+            action=AICopilotRecommendation.ACTION_WATCH,
+            score_overall=0.2,
+        )
+        reject_resp = self.client.post(
+            reverse("aso:ai_copilot_recommendation_reject", args=[draft.id])
+        )
+        self.assertEqual(reject_resp.status_code, 200)
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AICopilotRecommendation.STATUS_REJECTED)
+
+    def test_metadata_accept_and_reject_endpoints(self):
+        accept_resp = self.client.post(
+            reverse("aso:ai_copilot_metadata_accept", args=[self.variant.id])
+        )
+        self.assertEqual(accept_resp.status_code, 200)
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.status, AICopilotMetadataVariant.STATUS_ACCEPTED)
+
+        draft = AICopilotMetadataVariant.objects.create(
+            run=self.run,
+            app=self.app,
+            title="Reject Variant",
+            subtitle="",
+            keyword_field="one,two",
+            predicted_impact=0.1,
+        )
+        reject_resp = self.client.post(
+            reverse("aso:ai_copilot_metadata_reject", args=[draft.id])
+        )
+        self.assertEqual(reject_resp.status_code, 200)
+        draft.refresh_from_db()
+        self.assertEqual(draft.status, AICopilotMetadataVariant.STATUS_REJECTED)

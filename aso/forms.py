@@ -9,7 +9,7 @@ class AppForm(forms.ModelForm):
 
     class Meta:
         model = App
-        fields = ["name", "bundle_id"]
+        fields = ["name", "bundle_id", "asc_app_id"]
         widgets = {
             "name": forms.TextInput(
                 attrs={
@@ -21,6 +21,12 @@ class AppForm(forms.ModelForm):
                 attrs={
                     "class": "w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500",
                     "placeholder": "com.example.myapp (optional)",
+                }
+            ),
+            "asc_app_id": forms.TextInput(
+                attrs={
+                    "class": "w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500",
+                    "placeholder": "1234567890 (App Store Connect app ID, optional)",
                 }
             ),
         }
@@ -156,7 +162,7 @@ class RuntimeConfigForm(forms.Form):
             }
         ),
         label="Available Models",
-        help_text="Comma-separated models shown in the AI Suggestions model dropdown.",
+        help_text="Comma-separated models shown in the AI Copilot model dropdown.",
     )
     ai_enable_online_context = forms.BooleanField(
         required=False,
@@ -212,6 +218,57 @@ class RuntimeConfigForm(forms.Form):
         label="User Prompt Template",
         help_text="Use placeholders {{SNAPSHOT_JSON}} and {{ONLINE_CONTEXT_JSON}}.",
     )
+    asc_issuer_id = forms.CharField(
+        required=False,
+        widget=forms.TextInput(
+            attrs={
+                "class": "w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500",
+                "placeholder": "Issuer ID",
+            }
+        ),
+        label="App Store Connect Issuer ID",
+    )
+    asc_key_id = forms.CharField(
+        required=False,
+        widget=forms.TextInput(
+            attrs={
+                "class": "w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500",
+                "placeholder": "Key ID (kid)",
+            }
+        ),
+        label="App Store Connect Key ID",
+    )
+    asc_private_key_pem = forms.CharField(
+        required=False,
+        widget=forms.Textarea(
+            attrs={
+                "class": "w-full min-h-[140px] bg-slate-700 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500",
+                "placeholder": "-----BEGIN PRIVATE KEY----- ...",
+            }
+        ),
+        label="App Store Connect Private Key (PEM)",
+    )
+    clear_asc_private_key = forms.BooleanField(
+        required=False,
+        widget=forms.CheckboxInput(
+            attrs={
+                "class": "rounded border-white/20 bg-slate-700 text-purple-500 focus:ring-purple-500",
+            }
+        ),
+        label="Clear stored App Store Connect private key",
+    )
+    asc_default_days_back = forms.IntegerField(
+        required=False,
+        min_value=1,
+        max_value=365,
+        widget=forms.NumberInput(
+            attrs={
+                "class": "w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500",
+                "placeholder": "30",
+            }
+        ),
+        label="ASC sync default days back (1-365)",
+    )
 
     def __init__(self, *args, config, **kwargs):
         self.config = config
@@ -246,6 +303,9 @@ class RuntimeConfigForm(forms.Form):
         self.fields["ai_user_prompt_template"].initial = (
             config.ai_user_prompt_template or settings.AI_USER_PROMPT_TEMPLATE
         )
+        self.fields["asc_issuer_id"].initial = config.asc_issuer_id
+        self.fields["asc_key_id"].initial = config.asc_key_id
+        self.fields["asc_default_days_back"].initial = config.asc_default_days_back or settings.ASC_DEFAULT_DAYS_BACK
 
     def save(self):
         if self.cleaned_data.get("clear_openai_api_key"):
@@ -268,5 +328,14 @@ class RuntimeConfigForm(forms.Form):
         self.config.ai_user_prompt_template = (
             self.cleaned_data.get("ai_user_prompt_template") or ""
         ).strip()
+        self.config.asc_issuer_id = (self.cleaned_data.get("asc_issuer_id") or "").strip()
+        self.config.asc_key_id = (self.cleaned_data.get("asc_key_id") or "").strip()
+        if self.cleaned_data.get("clear_asc_private_key"):
+            self.config.asc_private_key_pem = ""
+        else:
+            incoming_private_key = (self.cleaned_data.get("asc_private_key_pem") or "").strip()
+            if incoming_private_key:
+                self.config.asc_private_key_pem = incoming_private_key
+        self.config.asc_default_days_back = self.cleaned_data.get("asc_default_days_back")
         self.config.save()
         return self.config

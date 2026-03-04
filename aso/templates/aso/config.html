@@ -6,7 +6,7 @@
 <div class="max-w-4xl mx-auto space-y-5">
     <div>
         <h1 class="text-xl font-bold text-white">Config</h1>
-        <p class="text-slate-400 text-sm mt-0.5">Manage runtime settings for AI suggestions.</p>
+        <p class="text-slate-400 text-sm mt-0.5">Manage runtime settings for AI Copilot and integrations.</p>
     </div>
 
     {% if saved %}
@@ -41,6 +41,22 @@
             Online market context: <span class="text-slate-300">{% if effective_online_context_enabled %}Enabled{% else %}Disabled{% endif %}</span>
             · Top apps/country: <span class="text-slate-300">{{ effective_online_top_apps_per_country }}</span>
             · History rows to AI: <span class="text-slate-300">{{ effective_history_rows_max }}</span>
+        </div>
+    </div>
+
+    <div class="bg-[#1e293b] border border-white/10 rounded-xl p-4 space-y-3">
+        <h2 class="text-base font-semibold text-white">App Store Connect</h2>
+        <div class="text-xs text-slate-400">
+            Credentials:
+            {% if asc_configured %}
+            <span class="text-green-300 font-medium">Configured</span>
+            <span class="text-slate-500">({{ asc_key_source }})</span>
+            {% else %}
+            <span class="text-red-300 font-medium">Missing</span>
+            {% endif %}
+        </div>
+        <div class="text-xs text-slate-500">
+            Default sync window: <span class="text-slate-300">{{ effective_asc_default_days_back }} days</span>
         </div>
     </div>
 
@@ -104,6 +120,35 @@
                     <label for="{{ form.ai_user_prompt_template.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.ai_user_prompt_template.label }}</label>
                     {{ form.ai_user_prompt_template }}
                     <p class="text-xs text-slate-500 mt-1">{{ form.ai_user_prompt_template.help_text }}</p>
+                </div>
+            </div>
+
+            <div class="pt-2 border-t border-white/10">
+                <h3 class="text-sm font-semibold text-white mb-3">App Store Connect</h3>
+                <p class="text-xs text-slate-500 mb-3">
+                    Required for importing app analytics signals into AI Copilot scoring.
+                </p>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label for="{{ form.asc_issuer_id.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.asc_issuer_id.label }}</label>
+                        {{ form.asc_issuer_id }}
+                    </div>
+                    <div>
+                        <label for="{{ form.asc_key_id.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.asc_key_id.label }}</label>
+                        {{ form.asc_key_id }}
+                    </div>
+                    <div class="sm:col-span-2">
+                        <label for="{{ form.asc_private_key_pem.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.asc_private_key_pem.label }}</label>
+                        {{ form.asc_private_key_pem }}
+                    </div>
+                    <div>
+                        <label for="{{ form.asc_default_days_back.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.asc_default_days_back.label }}</label>
+                        {{ form.asc_default_days_back }}
+                    </div>
+                </div>
+                <div class="flex items-center gap-2 text-sm text-slate-300 mt-3">
+                    {{ form.clear_asc_private_key }}
+                    <label for="{{ form.clear_asc_private_key.id_for_label }}">{{ form.clear_asc_private_key.label }}</label>
                 </div>
             </div>
 

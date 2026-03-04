@@ -189,6 +189,10 @@ AI_ONLINE_TOP_APPS_PER_COUNTRY = int_env(
     min_value=5,
     max_value=50,
 )
+ASC_TIMEOUT_SECONDS = float_env("ASC_TIMEOUT_SECONDS", 30.0, min_value=5.0, max_value=120.0)
+ASC_MAX_RETRIES = int_env("ASC_MAX_RETRIES", 2, min_value=0, max_value=10)
+ASC_DEFAULT_DAYS_BACK = int_env("ASC_DEFAULT_DAYS_BACK", 30, min_value=1, max_value=365)
+ASC_JWT_TTL_MINUTES = int_env("ASC_JWT_TTL_MINUTES", 20, min_value=1, max_value=20)
 DEFAULT_AI_SYSTEM_PROMPT = (
     "You are a senior Apple App Store Optimization analyst. "
     "Your job is to propose practical keyword opportunities for ONE specific iOS app. "
