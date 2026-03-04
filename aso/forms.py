@@ -1,3 +1,4 @@
+from django.conf import settings
 from django import forms
 
 from .models import App
@@ -136,12 +137,12 @@ class RuntimeConfigForm(forms.Form):
         ),
         label="Clear stored API key override",
     )
-    openai_default_model = forms.CharField(
+    openai_default_model = forms.ChoiceField(
         required=False,
-        widget=forms.TextInput(
+        choices=[],
+        widget=forms.Select(
             attrs={
                 "class": "w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500",
-                "placeholder": "gpt-4.1-mini",
             }
         ),
         label="Default AI Model",
@@ -215,13 +216,36 @@ class RuntimeConfigForm(forms.Form):
     def __init__(self, *args, config, **kwargs):
         self.config = config
         super().__init__(*args, **kwargs)
-        self.fields["openai_default_model"].initial = config.openai_default_model
-        self.fields["openai_available_models"].initial = config.openai_available_models
-        self.fields["ai_enable_online_context"].initial = bool(config.ai_enable_online_context)
-        self.fields["ai_online_top_apps_per_country"].initial = config.ai_online_top_apps_per_country
-        self.fields["ai_history_rows_max"].initial = config.ai_history_rows_max
-        self.fields["ai_system_prompt"].initial = config.ai_system_prompt
-        self.fields["ai_user_prompt_template"].initial = config.ai_user_prompt_template
+        available_model_csv = config.openai_available_models.strip() or ",".join(
+            settings.OPENAI_AVAILABLE_MODELS
+        )
+        models = []
+        for raw in available_model_csv.split(","):
+            value = raw.strip()
+            if value and value not in models:
+                models.append(value)
+        default_model = config.openai_default_model.strip() or settings.OPENAI_MODEL
+        if default_model and default_model not in models:
+            models.insert(0, default_model)
+        self.fields["openai_default_model"].choices = [("", "(Use environment default)")] + [
+            (m, m) for m in models
+        ]
+        self.fields["openai_default_model"].initial = default_model
+        self.fields["openai_available_models"].initial = available_model_csv
+        if config.ai_enable_online_context is None:
+            self.fields["ai_enable_online_context"].initial = settings.AI_ENABLE_ONLINE_CONTEXT
+        else:
+            self.fields["ai_enable_online_context"].initial = bool(config.ai_enable_online_context)
+        self.fields["ai_online_top_apps_per_country"].initial = (
+            config.ai_online_top_apps_per_country or settings.AI_ONLINE_TOP_APPS_PER_COUNTRY
+        )
+        self.fields["ai_history_rows_max"].initial = (
+            config.ai_history_rows_max or settings.AI_HISTORY_ROWS_MAX
+        )
+        self.fields["ai_system_prompt"].initial = config.ai_system_prompt or settings.AI_SYSTEM_PROMPT
+        self.fields["ai_user_prompt_template"].initial = (
+            config.ai_user_prompt_template or settings.AI_USER_PROMPT_TEMPLATE
+        )
 
     def save(self):
         if self.cleaned_data.get("clear_openai_api_key"):

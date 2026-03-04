@@ -90,6 +90,12 @@
 
             <div class="pt-2 border-t border-white/10">
                 <h3 class="text-sm font-semibold text-white mb-3">Prompt Tuning</h3>
+                <p class="text-xs text-slate-500 mb-3">
+                    Starter prompts are prefilled. Tune them for your app niche.
+                    Keep <code>{% templatetag openvariable %}SNAPSHOT_JSON{% templatetag closevariable %}</code> and
+                    <code>{% templatetag openvariable %}ONLINE_CONTEXT_JSON{% templatetag closevariable %}</code>
+                    placeholders to retain full data context.
+                </p>
                 <div>
                     <label for="{{ form.ai_system_prompt.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.ai_system_prompt.label }}</label>
                     {{ form.ai_system_prompt }}

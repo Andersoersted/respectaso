@@ -159,9 +159,18 @@ if AUTO_REFRESH_MODE not in {"external", "thread"}:
     AUTO_REFRESH_MODE = "external"
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+DEFAULT_OPENAI_MODEL = "gpt-5-mini"
+DEFAULT_OPENAI_AVAILABLE_MODELS = [
+    "gpt-5.2",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-5",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+]
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
 OPENAI_AVAILABLE_MODELS = []
-for _model in csv_env("OPENAI_AVAILABLE_MODELS", [OPENAI_MODEL]):
+for _model in csv_env("OPENAI_AVAILABLE_MODELS", DEFAULT_OPENAI_AVAILABLE_MODELS):
     _value = _model.strip()
     if _value and _value not in OPENAI_AVAILABLE_MODELS:
         OPENAI_AVAILABLE_MODELS.append(_value)
@@ -181,15 +190,18 @@ AI_ONLINE_TOP_APPS_PER_COUNTRY = int_env(
     max_value=50,
 )
 DEFAULT_AI_SYSTEM_PROMPT = (
-    "You are an App Store Optimization analyst for Apple App Store only. "
-    "Use the provided app metadata, tracked keyword history, and market context to generate practical keyword ideas. "
-    "Focus on intent relevance, realistic competition, and discoverability. "
-    "Avoid duplicates, vague buzzwords, or off-topic suggestions."
+    "You are a senior Apple App Store Optimization analyst. "
+    "Your job is to propose practical keyword opportunities for ONE specific iOS app. "
+    "Always reason from the provided app metadata, tracked keyword history, and online market context. "
+    "Prioritize discoverability + conversion intent + realistic competitiveness. "
+    "Do not return duplicates, irrelevant terms, brand-infringing terms, or generic filler."
 )
 AI_SYSTEM_PROMPT = os.environ.get("AI_SYSTEM_PROMPT", DEFAULT_AI_SYSTEM_PROMPT).strip() or DEFAULT_AI_SYSTEM_PROMPT
 DEFAULT_AI_USER_PROMPT_TEMPLATE = (
     "Task: propose high-quality Apple App Store keyword candidates for this app.\n"
-    "You must use all available context below.\n\n"
+    "Use ALL context below before deciding.\n"
+    "For each candidate, the rationale must mention market or historical evidence.\n"
+    "Prefer terms that match actual user intent for this app's use-case, not broad vanity terms.\n\n"
     "APP + HISTORICAL DATA JSON:\n"
     "{{SNAPSHOT_JSON}}\n\n"
     "ONLINE MARKET CONTEXT JSON:\n"
