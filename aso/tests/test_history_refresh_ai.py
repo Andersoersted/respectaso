@@ -1079,3 +1079,74 @@ class AICopilotOpenAIRequestTests(TestCase):
 
         self.assertIsNotNone(dummy.responses.kwargs)
         self.assertEqual(dummy.responses.kwargs.get("reasoning", {}).get("effort"), "high")
+
+    @patch("aso.copilot_ai_service._build_openai_client")
+    def test_generate_with_openai_parses_raw_output_text_without_chat_fallback(self, mock_build_client):
+        raw_payload = {
+            "recommendations": [
+                {
+                    "keyword": "raw keyword",
+                    "action": "add",
+                    "rationale": "raw parse",
+                    "llm_confidence": 0.7,
+                }
+            ],
+            "metadata_variants": [
+                {
+                    "title": "Raw Title",
+                    "subtitle": "Raw subtitle",
+                    "keyword_field": "raw,keyword",
+                    "covered_keywords": ["raw keyword"],
+                    "predicted_impact": 0.6,
+                    "rationale": "raw variant",
+                }
+            ],
+        }
+
+        class DummyResponses:
+            def __init__(self):
+                self.kwargs = None
+
+            def parse(self, **kwargs):
+                self.kwargs = kwargs
+                return SimpleNamespace(
+                    output_parsed=None,
+                    output_text=json.dumps(raw_payload),
+                    output=[],
+                    status="completed",
+                    _request_id="req_test_raw",
+                )
+
+        class DummyChatCompletions:
+            def parse(self, **_kwargs):
+                raise AssertionError("chat fallback should not be called when raw responses output is valid")
+
+        class DummyClient:
+            def __init__(self):
+                self.responses = DummyResponses()
+                self.chat = SimpleNamespace(completions=DummyChatCompletions())
+
+            def with_options(self, **_kwargs):
+                return self
+
+        dummy = DummyClient()
+        mock_build_client.return_value = dummy
+
+        output = _generate_with_openai(
+            snapshot={
+                "feature_rows": [{"keyword": "one"}],
+                "existing_keywords": ["one"],
+            },
+            settings_obj=CopilotSettings(
+                model="gpt-5-mini",
+                api_key="sk-test-123",
+                system_prompt="System",
+                user_prompt_template="{{SNAPSHOT_JSON}}",
+                reasoning_effort="medium",
+            ),
+            run_id=123,
+            attempt="primary",
+            timeout_seconds=20.0,
+        )
+
+        self.assertEqual(output.recommendations[0].keyword, "raw keyword")

@@ -38,7 +38,7 @@ SNAPSHOT_FEATURE_ROWS_LIMIT = 80
 SNAPSHOT_EXISTING_KEYWORDS_LIMIT = 120
 SNAPSHOT_RETRY_FEATURE_ROWS_LIMIT = 30
 SNAPSHOT_RETRY_EXISTING_KEYWORDS_LIMIT = 60
-OPENAI_COPILOT_MAX_OUTPUT_TOKENS = 1600
+OPENAI_COPILOT_MAX_OUTPUT_TOKENS = 2200
 COPILOT_MAX_EVENT_LOG_ENTRIES = 120
 
 
@@ -191,6 +191,9 @@ def _is_recoverable_generation_error(exc: Exception) -> bool:
         "json_invalid",
         "eof while parsing",
         "lengthfinishreasonerror",
+        "incomplete response",
+        "max_output_tokens",
+        "no structured payload",
     )
     return any(marker in text for marker in recoverable_markers)
 
@@ -273,6 +276,246 @@ def _extract_responses_parse(output: Any) -> CopilotOutput | None:
             if isinstance(parsed_block, CopilotOutput):
                 return parsed_block
     return None
+
+
+def _extract_response_incomplete_reason(response: Any) -> tuple[str, str]:
+    status = str(getattr(response, "status", "") or "").strip().lower()
+    details = getattr(response, "incomplete_details", None)
+    reason = ""
+    if isinstance(details, dict):
+        reason = str(details.get("reason") or "").strip().lower()
+    elif details is not None:
+        reason = str(getattr(details, "reason", "") or "").strip().lower()
+    return status, reason
+
+
+def _extract_response_text_candidates(response: Any) -> list[str]:
+    candidates: list[str] = []
+    output_text = getattr(response, "output_text", None)
+    if output_text:
+        text = str(output_text).strip()
+        if text:
+            candidates.append(text)
+    output_items = getattr(response, "output", None)
+    if isinstance(output_items, list):
+        for item in output_items:
+            content = getattr(item, "content", None)
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                block_type = str(getattr(block, "type", "") or "").strip().lower()
+                if block_type != "output_text":
+                    continue
+                text = str(getattr(block, "text", "") or "").strip()
+                if text:
+                    candidates.append(text)
+    deduped: list[str] = []
+    seen = set()
+    for value in candidates:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _extract_refusal_from_response(response: Any) -> str:
+    output_items = getattr(response, "output", None)
+    if not isinstance(output_items, list):
+        return ""
+    for item in output_items:
+        content = getattr(item, "content", None)
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            block_type = str(getattr(block, "type", "") or "").strip().lower()
+            if block_type != "refusal":
+                continue
+            refusal = str(getattr(block, "refusal", "") or "").strip()
+            if refusal:
+                return refusal
+    return ""
+
+
+def _json_candidate_variants(text: str) -> list[str]:
+    raw = str(text or "").strip()
+    variants: list[str] = []
+    if not raw:
+        return variants
+    variants.append(raw)
+
+    if "```" in raw:
+        fence_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", raw, flags=re.IGNORECASE | re.DOTALL)
+        if fence_match:
+            fenced = fence_match.group(1).strip()
+            if fenced and fenced not in variants:
+                variants.append(fenced)
+
+    first_brace = raw.find("{")
+    last_brace = raw.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        sliced = raw[first_brace : last_brace + 1].strip()
+        if sliced and sliced not in variants:
+            variants.append(sliced)
+    return variants
+
+
+def _coerce_copilot_output_from_response_text(text: str) -> tuple[CopilotOutput | None, str]:
+    last_error = ""
+    for candidate in _json_candidate_variants(text):
+        try:
+            return CopilotOutput.model_validate_json(candidate), ""
+        except Exception as exc:
+            last_error = str(exc)
+    return None, last_error
+
+
+def _fallback_reasoning_for_retry(value: str) -> str:
+    effort = _normalize_reasoning_effort(value)
+    if effort in {"xhigh", "high"}:
+        return "medium"
+    if effort == "medium":
+        return "low"
+    if effort == "low":
+        return "minimal"
+    return effort
+
+
+def _output_summary_json(
+    parsed: CopilotOutput,
+    *,
+    route: str,
+    attempt: str,
+    request_id: str | None,
+    parser: str = "sdk",
+) -> str:
+    payload = {
+        "route": route,
+        "attempt": attempt,
+        "request_id": request_id or None,
+        "parser": parser,
+        "recommendations": len(parsed.recommendations),
+        "metadata_variants": len(parsed.metadata_variants),
+        "recommendation_keywords": [item.keyword for item in parsed.recommendations[:8]],
+        "metadata_titles": [item.title for item in parsed.metadata_variants[:5]],
+    }
+    return json.dumps(payload, ensure_ascii=True)
+
+
+def _coerce_copilot_output_from_response(
+    response: Any,
+    *,
+    route: str,
+    attempt: str,
+    run: AICopilotRun | None,
+    run_id: int | None,
+    started_at: float,
+) -> CopilotOutput:
+    parsed = _extract_responses_parse(response)
+    request_id = getattr(response, "_request_id", None)
+    if parsed is not None:
+        output_summary_json = _output_summary_json(
+            parsed,
+            route=route,
+            attempt=attempt,
+            request_id=request_id,
+            parser="sdk",
+        )
+        logger.warning(
+            "Copilot run %s %s succeeded in %.2fs summary=%s",
+            run_id or "-",
+            route,
+            time.perf_counter() - started_at,
+            output_summary_json,
+        )
+        _append_run_event(
+            run,
+            stage="model_output_received",
+            message=f"OpenAI response summary: {output_summary_json}",
+            kind="success",
+        )
+        return parsed
+
+    parse_errors: list[str] = []
+    candidates = _extract_response_text_candidates(response)
+    for candidate in candidates:
+        parsed_candidate, parse_error = _coerce_copilot_output_from_response_text(candidate)
+        if parsed_candidate is None:
+            if parse_error:
+                parse_errors.append(parse_error)
+            continue
+        output_summary_json = _output_summary_json(
+            parsed_candidate,
+            route=route,
+            attempt=attempt,
+            request_id=request_id,
+            parser="local_json",
+        )
+        logger.warning(
+            "Copilot run %s %s parsed raw text in %.2fs summary=%s",
+            run_id or "-",
+            route,
+            time.perf_counter() - started_at,
+            output_summary_json,
+        )
+        _append_run_event(
+            run,
+            stage="model_output_received",
+            kind="success",
+            message=f"OpenAI response summary: {output_summary_json}",
+        )
+        return parsed_candidate
+
+    refusal = _extract_refusal_from_response(response)
+    if refusal:
+        raise AICopilotError(refusal, user_error=True)
+
+    status, incomplete_reason = _extract_response_incomplete_reason(response)
+    parse_error_sample = _truncate_chars("; ".join(parse_errors), 280)
+    preview = _truncate_chars(candidates[0] if candidates else "", 180)
+    if status == "incomplete":
+        detail = (
+            "OpenAI returned an incomplete response "
+            f"(reason={incomplete_reason or 'unknown'})."
+        )
+        logger.warning(
+            "Copilot run %s %s returned incomplete response in %.2fs reason=%s parse_errors=%s preview=%s",
+            run_id or "-",
+            route,
+            time.perf_counter() - started_at,
+            incomplete_reason or "-",
+            parse_error_sample or "-",
+            preview or "-",
+        )
+        _append_run_event(
+            run,
+            stage="generating_recommendations",
+            kind="error",
+            message=f"{detail} Retry will use a compact snapshot.",
+        )
+        raise AICopilotError(
+            f"Copilot generation failed: {detail} Retry, or reduce output size.",
+            user_error=False,
+        )
+
+    logger.warning(
+        "Copilot run %s %s returned no structured payload in %.2fs parse_errors=%s preview=%s",
+        run_id or "-",
+        route,
+        time.perf_counter() - started_at,
+        parse_error_sample or "-",
+        preview or "-",
+    )
+    _append_run_event(
+        run,
+        stage="generating_recommendations",
+        kind="error",
+        message="OpenAI returned no structured payload. Retrying with compact snapshot.",
+    )
+    raise AICopilotError(
+        "Copilot generation failed: OpenAI returned no structured payload.",
+        user_error=False,
+    )
 
 
 def _openai_error_meta(exc: Exception) -> dict[str, Any]:
@@ -366,7 +609,6 @@ def _format_openai_exception(exc: Exception) -> tuple[str, bool]:
 def _should_fallback_after_responses_error(exc: Exception, *, meta: dict[str, Any]) -> bool:
     """Only fallback when responses.parse appears unsupported for this route/model."""
     status_code = meta.get("status_code")
-    exception_type = str(meta.get("exception_type") or "")
     text = f"{exc} {meta.get('body_excerpt') or ''}".lower()
 
     if _is_openai_exc(
@@ -395,19 +637,7 @@ def _should_fallback_after_responses_error(exc: Exception, *, meta: dict[str, An
         "unrecognized",
     )
     has_parse_marker = any(marker in text for marker in parse_unsupported_markers)
-    recoverable_parse_markers = (
-        "validation error for copilotoutput",
-        "json_invalid",
-        "eof while parsing",
-        "lengthfinishreasonerror",
-    )
-    has_recoverable_parse_marker = any(marker in text for marker in recoverable_parse_markers)
-
     if _is_openai_exc(exc, "NotFoundError"):
-        return True
-    if exception_type in {"ValidationError", "LengthFinishReasonError", "ContentFilterFinishReasonError"}:
-        return True
-    if has_recoverable_parse_marker:
         return True
     if _is_openai_exc(exc, "BadRequestError") and has_parse_marker:
         return True
@@ -426,16 +656,26 @@ def _generate_with_openai(
     timeout_seconds: float | None = None,
 ) -> CopilotOutput:
     effective_run_id = run_id or (run.id if run else None)
-    effective_timeout = float(timeout_seconds or settings.OPENAI_TIMEOUT_SECONDS)
+    user_prompt = _render_prompt(settings_obj.user_prompt_template, snapshot)
+    model = settings_obj.model
+    reasoning_effort = _default_reasoning_effort_for_model(model, settings_obj.reasoning_effort)
+    if attempt != "primary":
+        reasoning_effort = _fallback_reasoning_for_retry(reasoning_effort)
+
+    base_timeout = float(timeout_seconds or settings.OPENAI_TIMEOUT_SECONDS)
+    adaptive_floor = 60.0
+    if reasoning_effort in {"medium", "high", "xhigh"}:
+        adaptive_floor = 90.0
+    if len(user_prompt) >= 8500:
+        adaptive_floor = max(adaptive_floor, 120.0)
+    effective_timeout = max(base_timeout, adaptive_floor)
+
     client = _build_openai_client(settings_obj.api_key)
     request_client = client.with_options(
         timeout=effective_timeout,
         # Keep retries explicit and bounded in app logic to avoid multi-minute cascaded waits.
         max_retries=0,
     )
-    user_prompt = _render_prompt(settings_obj.user_prompt_template, snapshot)
-    model = settings_obj.model
-    reasoning_effort = _default_reasoning_effort_for_model(model, settings_obj.reasoning_effort)
     top_keywords = [
         _clean_keyword(str(row.get("keyword") or ""))
         for row in (snapshot.get("feature_rows") or [])[:8]
@@ -445,6 +685,7 @@ def _generate_with_openai(
         "attempt": attempt,
         "model": model,
         "timeout_seconds": round(effective_timeout, 2),
+        "configured_timeout_seconds": round(base_timeout, 2),
         "reasoning_effort": reasoning_effort or "auto",
         "feature_rows": len(snapshot.get("feature_rows") or []),
         "existing_keywords": len(snapshot.get("existing_keywords") or []),
@@ -491,47 +732,17 @@ def _generate_with_openai(
     responses_started = time.perf_counter()
     try:
         response = request_client.responses.parse(**responses_parse_kwargs)
-        parsed = _extract_responses_parse(response)
-        if parsed is not None:
-            req_id = getattr(response, "_request_id", None)
-            output_summary = {
-                "route": "responses.parse",
-                "attempt": attempt,
-                "request_id": req_id or None,
-                "recommendations": len(parsed.recommendations),
-                "metadata_variants": len(parsed.metadata_variants),
-                "recommendation_keywords": [item.keyword for item in parsed.recommendations[:8]],
-                "metadata_titles": [item.title for item in parsed.metadata_variants[:5]],
-            }
-            output_summary_json = json.dumps(output_summary, ensure_ascii=True)
-            logger.warning(
-                "Copilot run %s responses.parse succeeded in %.2fs summary=%s",
-                effective_run_id or "-",
-                time.perf_counter() - responses_started,
-                output_summary_json,
-            )
-            _append_run_event(
-                run,
-                stage="model_output_received",
-                message=f"OpenAI response summary: {output_summary_json}",
-                kind="success",
-            )
-            return parsed
-        logger.warning(
-            "Copilot run %s responses.parse returned no parsed payload in %.2fs attempt=%s; trying chat.completions.parse",
-            effective_run_id or "-",
-            time.perf_counter() - responses_started,
-            attempt,
-        )
-        _append_run_event(
-            run,
-            stage="generating_recommendations",
-            message=(
-                f"responses.parse returned no structured payload in {time.perf_counter() - responses_started:.2f}s; "
-                "switching to chat.completions.parse fallback."
-            ),
+        return _coerce_copilot_output_from_response(
+            response,
+            route="responses.parse",
+            attempt=attempt,
+            run=run,
+            run_id=effective_run_id,
+            started_at=responses_started,
         )
     except Exception as exc:
+        if isinstance(exc, AICopilotError):
+            raise
         meta = _openai_error_meta(exc)
         logger.warning(
             "Copilot run %s responses.parse failed for model %s in %.2fs attempt=%s type=%s status=%s request_id=%s detail=%s body=%s",
@@ -583,38 +794,17 @@ def _generate_with_openai(
                 retry_started = time.perf_counter()
                 try:
                     retry_response = request_client.responses.parse(**retry_parse_kwargs)
-                    retry_parsed = _extract_responses_parse(retry_response)
-                    if retry_parsed is not None:
-                        retry_req_id = getattr(retry_response, "_request_id", None)
-                        output_summary = {
-                            "route": "responses.parse",
-                            "attempt": f"{attempt}:reasoning_retry",
-                            "request_id": retry_req_id or None,
-                            "recommendations": len(retry_parsed.recommendations),
-                            "metadata_variants": len(retry_parsed.metadata_variants),
-                            "recommendation_keywords": [item.keyword for item in retry_parsed.recommendations[:8]],
-                            "metadata_titles": [item.title for item in retry_parsed.metadata_variants[:5]],
-                        }
-                        output_summary_json = json.dumps(output_summary, ensure_ascii=True)
-                        logger.warning(
-                            "Copilot run %s responses.parse reasoning fallback succeeded in %.2fs summary=%s",
-                            effective_run_id or "-",
-                            time.perf_counter() - retry_started,
-                            output_summary_json,
-                        )
-                        _append_run_event(
-                            run,
-                            stage="model_output_received",
-                            kind="success",
-                            message=f"OpenAI response summary: {output_summary_json}",
-                        )
-                        return retry_parsed
-                    logger.warning(
-                        "Copilot run %s responses.parse reasoning fallback returned no parsed payload in %.2fs; using chat.completions.parse fallback",
-                        effective_run_id or "-",
-                        time.perf_counter() - retry_started,
+                    return _coerce_copilot_output_from_response(
+                        retry_response,
+                        route="responses.parse",
+                        attempt=f"{attempt}:reasoning_retry",
+                        run=run,
+                        run_id=effective_run_id,
+                        started_at=retry_started,
                     )
                 except Exception as retry_exc:
+                    if isinstance(retry_exc, AICopilotError):
+                        raise
                     retry_meta = _openai_error_meta(retry_exc)
                     logger.warning(
                         "Copilot run %s responses.parse reasoning fallback failed type=%s status=%s request_id=%s detail=%s body=%s",
@@ -700,16 +890,13 @@ def _generate_with_openai(
         refusal = getattr(message, "refusal", "") if message else ""
         raise AICopilotError(refusal or "Copilot model returned no structured output.", user_error=True)
     req_id = getattr(completion, "_request_id", None)
-    output_summary = {
-        "route": "chat.completions.parse",
-        "attempt": attempt,
-        "request_id": req_id or None,
-        "recommendations": len(parsed.recommendations),
-        "metadata_variants": len(parsed.metadata_variants),
-        "recommendation_keywords": [item.keyword for item in parsed.recommendations[:8]],
-        "metadata_titles": [item.title for item in parsed.metadata_variants[:5]],
-    }
-    output_summary_json = json.dumps(output_summary, ensure_ascii=True)
+    output_summary_json = _output_summary_json(
+        parsed,
+        route="chat.completions.parse",
+        attempt=attempt,
+        request_id=req_id,
+        parser="sdk",
+    )
     logger.warning(
         "Copilot run %s chat.completions.parse fallback succeeded in %.2fs summary=%s",
         effective_run_id or "-",
