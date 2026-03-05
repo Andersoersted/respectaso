@@ -38,7 +38,8 @@ SNAPSHOT_FEATURE_ROWS_LIMIT = 80
 SNAPSHOT_EXISTING_KEYWORDS_LIMIT = 120
 SNAPSHOT_RETRY_FEATURE_ROWS_LIMIT = 30
 SNAPSHOT_RETRY_EXISTING_KEYWORDS_LIMIT = 60
-OPENAI_COPILOT_MAX_OUTPUT_TOKENS = 1200
+OPENAI_COPILOT_MAX_OUTPUT_TOKENS = 1600
+COPILOT_MAX_EVENT_LOG_ENTRIES = 120
 
 
 class AICopilotError(Exception):
@@ -52,7 +53,7 @@ class AICopilotError(Exception):
 class RecommendationOut(BaseModel):
     keyword: str = Field(min_length=2, max_length=80)
     action: str = Field(default="watch")
-    rationale: str = Field(default="")
+    rationale: str = Field(default="", max_length=240)
     llm_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
@@ -62,12 +63,12 @@ class MetadataVariantOut(BaseModel):
     keyword_field: str = Field(default="", max_length=180)
     covered_keywords: list[str] = Field(default_factory=list)
     predicted_impact: float = Field(default=0.5, ge=0.0, le=1.0)
-    rationale: str = Field(default="")
+    rationale: str = Field(default="", max_length=280)
 
 
 class CopilotOutput(BaseModel):
-    recommendations: list[RecommendationOut] = Field(default_factory=list)
-    metadata_variants: list[MetadataVariantOut] = Field(default_factory=list)
+    recommendations: list[RecommendationOut] = Field(default_factory=list, max_length=30)
+    metadata_variants: list[MetadataVariantOut] = Field(default_factory=list, max_length=6)
 
 
 @dataclass(slots=True)
@@ -76,6 +77,7 @@ class CopilotSettings:
     api_key: str
     system_prompt: str
     user_prompt_template: str
+    reasoning_effort: str = ""
 
 
 def _build_openai_client(api_key: str):
@@ -155,6 +157,44 @@ def _is_timeout_error(exc: Exception) -> bool:
     return "timed out" in text or "timeout" in text
 
 
+def _normalize_reasoning_effort(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    allowed = {"", "none", "minimal", "low", "medium", "high", "xhigh"}
+    return raw if raw in allowed else ""
+
+
+def _default_reasoning_effort_for_model(model: str, configured_value: str | None) -> str:
+    configured = _normalize_reasoning_effort(configured_value)
+    if configured:
+        return configured
+    if str(model or "").lower().startswith("gpt-5"):
+        return "low"
+    return ""
+
+
+def _is_unsupported_reasoning_error(exc: Exception, *, meta: dict[str, Any]) -> bool:
+    status_code = meta.get("status_code")
+    text = f"{exc} {meta.get('body_excerpt') or ''}".lower()
+    return bool(
+        status_code == 400
+        and "reasoning.effort" in text
+        and ("unsupported value" in text or "supported values" in text)
+    )
+
+
+def _is_recoverable_generation_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    if _is_timeout_error(exc):
+        return True
+    recoverable_markers = (
+        "validation error for copilotoutput",
+        "json_invalid",
+        "eof while parsing",
+        "lengthfinishreasonerror",
+    )
+    return any(marker in text for marker in recoverable_markers)
+
+
 def _render_prompt(template: str, payload: dict[str, Any]) -> str:
     payload_json = json.dumps(payload, ensure_ascii=True)
     prompt = (template or "").replace("{{SNAPSHOT_JSON}}", payload_json)
@@ -193,6 +233,28 @@ def _compact_snapshot(snapshot: dict[str, Any], *, feature_rows_limit: int, exis
         "existing_keywords_limit": int(existing_keywords_limit),
     }
     return compact
+
+
+def _append_run_event(
+    run: AICopilotRun | None,
+    *,
+    stage: str,
+    message: str,
+    kind: str = "info",
+) -> None:
+    if not run:
+        return
+    events = list(run.events_json or [])
+    events.append(
+        {
+            "ts": timezone.now().isoformat(),
+            "stage": (stage or "info")[:64],
+            "kind": (kind or "info")[:16],
+            "message": _truncate_chars(str(message or ""), 500),
+        }
+    )
+    events = events[-COPILOT_MAX_EVENT_LOG_ENTRIES:]
+    _update_run_fields(run, events_json=events)
 
 
 def _extract_responses_parse(output: Any) -> CopilotOutput | None:
@@ -257,6 +319,12 @@ def _format_openai_exception(exc: Exception) -> tuple[str, bool]:
             f"{request_hint}",
             False,
         )
+    if "validation error for copilotoutput" in text or "json_invalid" in text or "eof while parsing" in text:
+        return (
+            "OpenAI returned incomplete structured JSON for Copilot output. "
+            f"Retry may succeed.{request_hint}",
+            False,
+        )
     if _is_openai_exc(exc, "RateLimitError") or status_code == 429 or "insufficient_quota" in text or "quota" in text:
         return (
             "OpenAI quota or rate limit was hit. Check OpenAI billing/usage and retry."
@@ -298,6 +366,7 @@ def _format_openai_exception(exc: Exception) -> tuple[str, bool]:
 def _should_fallback_after_responses_error(exc: Exception, *, meta: dict[str, Any]) -> bool:
     """Only fallback when responses.parse appears unsupported for this route/model."""
     status_code = meta.get("status_code")
+    exception_type = str(meta.get("exception_type") or "")
     text = f"{exc} {meta.get('body_excerpt') or ''}".lower()
 
     if _is_openai_exc(
@@ -326,8 +395,19 @@ def _should_fallback_after_responses_error(exc: Exception, *, meta: dict[str, An
         "unrecognized",
     )
     has_parse_marker = any(marker in text for marker in parse_unsupported_markers)
+    recoverable_parse_markers = (
+        "validation error for copilotoutput",
+        "json_invalid",
+        "eof while parsing",
+        "lengthfinishreasonerror",
+    )
+    has_recoverable_parse_marker = any(marker in text for marker in recoverable_parse_markers)
 
     if _is_openai_exc(exc, "NotFoundError"):
+        return True
+    if exception_type in {"ValidationError", "LengthFinishReasonError", "ContentFilterFinishReasonError"}:
+        return True
+    if has_recoverable_parse_marker:
         return True
     if _is_openai_exc(exc, "BadRequestError") and has_parse_marker:
         return True
@@ -340,10 +420,12 @@ def _generate_with_openai(
     *,
     snapshot: dict[str, Any],
     settings_obj: CopilotSettings,
+    run: AICopilotRun | None = None,
     run_id: int | None = None,
     attempt: str = "primary",
     timeout_seconds: float | None = None,
 ) -> CopilotOutput:
+    effective_run_id = run_id or (run.id if run else None)
     effective_timeout = float(timeout_seconds or settings.OPENAI_TIMEOUT_SECONDS)
     client = _build_openai_client(settings_obj.api_key)
     request_client = client.with_options(
@@ -353,7 +435,24 @@ def _generate_with_openai(
     )
     user_prompt = _render_prompt(settings_obj.user_prompt_template, snapshot)
     model = settings_obj.model
-    is_gpt5_family = model.lower().startswith("gpt-5")
+    reasoning_effort = _default_reasoning_effort_for_model(model, settings_obj.reasoning_effort)
+    top_keywords = [
+        _clean_keyword(str(row.get("keyword") or ""))
+        for row in (snapshot.get("feature_rows") or [])[:8]
+        if str(row.get("keyword") or "").strip()
+    ]
+    payload_summary = {
+        "attempt": attempt,
+        "model": model,
+        "timeout_seconds": round(effective_timeout, 2),
+        "reasoning_effort": reasoning_effort or "auto",
+        "feature_rows": len(snapshot.get("feature_rows") or []),
+        "existing_keywords": len(snapshot.get("existing_keywords") or []),
+        "top_keywords": top_keywords,
+        "system_prompt_chars": len(settings_obj.system_prompt or ""),
+        "user_prompt_chars": len(user_prompt),
+    }
+    payload_summary_json = json.dumps(payload_summary, ensure_ascii=True)
 
     responses_parse_kwargs: dict[str, Any] = {
         "model": model,
@@ -364,15 +463,25 @@ def _generate_with_openai(
         "text_format": CopilotOutput,
         "max_output_tokens": OPENAI_COPILOT_MAX_OUTPUT_TOKENS,
     }
-    if is_gpt5_family:
-        # Lower reasoning effort reduces latency for large prompts.
-        responses_parse_kwargs["reasoning"] = {"effort": "none"}
+    if reasoning_effort:
+        responses_parse_kwargs["reasoning"] = {"effort": reasoning_effort}
 
     logger.warning(
-        "Copilot run %s sending payload to OpenAI responses.parse attempt=%s model=%s timeout=%ss retries=%s snapshot_rows=%s existing_keywords=%s prompt_chars=%s",
-        run_id or "-",
+        "Copilot run %s sending payload to OpenAI responses.parse summary=%s",
+        effective_run_id or "-",
+        payload_summary_json,
+    )
+    _append_run_event(
+        run,
+        stage="generating_recommendations",
+        message=f"OpenAI request summary: {payload_summary_json}",
+    )
+    logger.warning(
+        "Copilot run %s sending payload to OpenAI responses.parse attempt=%s model=%s reasoning=%s timeout=%ss retries=%s snapshot_rows=%s existing_keywords=%s prompt_chars=%s",
+        effective_run_id or "-",
         attempt,
         model,
+        reasoning_effort or "auto",
         effective_timeout,
         0,
         len(snapshot.get("feature_rows") or []),
@@ -385,25 +494,48 @@ def _generate_with_openai(
         parsed = _extract_responses_parse(response)
         if parsed is not None:
             req_id = getattr(response, "_request_id", None)
+            output_summary = {
+                "route": "responses.parse",
+                "attempt": attempt,
+                "request_id": req_id or None,
+                "recommendations": len(parsed.recommendations),
+                "metadata_variants": len(parsed.metadata_variants),
+                "recommendation_keywords": [item.keyword for item in parsed.recommendations[:8]],
+                "metadata_titles": [item.title for item in parsed.metadata_variants[:5]],
+            }
+            output_summary_json = json.dumps(output_summary, ensure_ascii=True)
             logger.warning(
-                "Copilot run %s responses.parse succeeded in %.2fs attempt=%s request_id=%s",
-                run_id or "-",
+                "Copilot run %s responses.parse succeeded in %.2fs summary=%s",
+                effective_run_id or "-",
                 time.perf_counter() - responses_started,
-                attempt,
-                req_id or "-",
+                output_summary_json,
+            )
+            _append_run_event(
+                run,
+                stage="model_output_received",
+                message=f"OpenAI response summary: {output_summary_json}",
+                kind="success",
             )
             return parsed
         logger.warning(
             "Copilot run %s responses.parse returned no parsed payload in %.2fs attempt=%s; trying chat.completions.parse",
-            run_id or "-",
+            effective_run_id or "-",
             time.perf_counter() - responses_started,
             attempt,
+        )
+        _append_run_event(
+            run,
+            stage="generating_recommendations",
+            message=(
+                f"responses.parse returned no structured payload in {time.perf_counter() - responses_started:.2f}s; "
+                "switching to chat.completions.parse fallback."
+            ),
         )
     except Exception as exc:
         meta = _openai_error_meta(exc)
         logger.warning(
             "Copilot run %s responses.parse failed for model %s in %.2fs attempt=%s type=%s status=%s request_id=%s detail=%s body=%s",
-            run_id or "-",
+            effective_run_id or "-",
             model,
             time.perf_counter() - responses_started,
             attempt,
@@ -413,6 +545,97 @@ def _generate_with_openai(
             exc,
             meta.get("body_excerpt") or "-",
         )
+        _append_run_event(
+            run,
+            stage="generating_recommendations",
+            kind="error",
+            message=(
+                "responses.parse failed "
+                f"(type={meta.get('exception_type')}, status={meta.get('status_code')}, "
+                f"request_id={meta.get('request_id') or '-'}): {exc}"
+            ),
+        )
+
+        if _is_unsupported_reasoning_error(exc, meta=meta) and reasoning_effort:
+            fallback_reasoning_effort = "low" if model.lower().startswith("gpt-5") else ""
+            if fallback_reasoning_effort == reasoning_effort:
+                fallback_reasoning_effort = ""
+            if fallback_reasoning_effort != reasoning_effort:
+                retry_parse_kwargs = dict(responses_parse_kwargs)
+                if fallback_reasoning_effort:
+                    retry_parse_kwargs["reasoning"] = {"effort": fallback_reasoning_effort}
+                else:
+                    retry_parse_kwargs.pop("reasoning", None)
+                logger.warning(
+                    "Copilot run %s retrying responses.parse with fallback reasoning effort=%s (initial=%s)",
+                    effective_run_id or "-",
+                    fallback_reasoning_effort or "auto",
+                    reasoning_effort,
+                )
+                _append_run_event(
+                    run,
+                    stage="retrying_reasoning",
+                    message=(
+                        "Selected reasoning effort is unsupported for this model. Retrying with "
+                        f"reasoning={fallback_reasoning_effort or 'auto'}."
+                    ),
+                )
+                retry_started = time.perf_counter()
+                try:
+                    retry_response = request_client.responses.parse(**retry_parse_kwargs)
+                    retry_parsed = _extract_responses_parse(retry_response)
+                    if retry_parsed is not None:
+                        retry_req_id = getattr(retry_response, "_request_id", None)
+                        output_summary = {
+                            "route": "responses.parse",
+                            "attempt": f"{attempt}:reasoning_retry",
+                            "request_id": retry_req_id or None,
+                            "recommendations": len(retry_parsed.recommendations),
+                            "metadata_variants": len(retry_parsed.metadata_variants),
+                            "recommendation_keywords": [item.keyword for item in retry_parsed.recommendations[:8]],
+                            "metadata_titles": [item.title for item in retry_parsed.metadata_variants[:5]],
+                        }
+                        output_summary_json = json.dumps(output_summary, ensure_ascii=True)
+                        logger.warning(
+                            "Copilot run %s responses.parse reasoning fallback succeeded in %.2fs summary=%s",
+                            effective_run_id or "-",
+                            time.perf_counter() - retry_started,
+                            output_summary_json,
+                        )
+                        _append_run_event(
+                            run,
+                            stage="model_output_received",
+                            kind="success",
+                            message=f"OpenAI response summary: {output_summary_json}",
+                        )
+                        return retry_parsed
+                    logger.warning(
+                        "Copilot run %s responses.parse reasoning fallback returned no parsed payload in %.2fs; using chat.completions.parse fallback",
+                        effective_run_id or "-",
+                        time.perf_counter() - retry_started,
+                    )
+                except Exception as retry_exc:
+                    retry_meta = _openai_error_meta(retry_exc)
+                    logger.warning(
+                        "Copilot run %s responses.parse reasoning fallback failed type=%s status=%s request_id=%s detail=%s body=%s",
+                        effective_run_id or "-",
+                        retry_meta.get("exception_type"),
+                        retry_meta.get("status_code"),
+                        retry_meta.get("request_id") or "-",
+                        retry_exc,
+                        retry_meta.get("body_excerpt") or "-",
+                    )
+                    _append_run_event(
+                        run,
+                        stage="retrying_reasoning",
+                        kind="error",
+                        message=(
+                            "Reasoning fallback retry failed "
+                            f"(type={retry_meta.get('exception_type')}, status={retry_meta.get('status_code')}, "
+                            f"request_id={retry_meta.get('request_id') or '-'}): {retry_exc}"
+                        ),
+                    )
+
         if not _should_fallback_after_responses_error(exc, meta=meta):
             formatted, user_error = _format_openai_exception(exc)
             raise AICopilotError(f"Copilot generation failed: {formatted}", user_error=user_error) from exc
@@ -420,9 +643,17 @@ def _generate_with_openai(
     # Fallback for models/routes without responses structured parsing.
     logger.warning(
         "Copilot run %s starting chat.completions.parse fallback attempt=%s model=%s",
-        run_id or "-",
+        effective_run_id or "-",
         attempt,
         model,
+    )
+    _append_run_event(
+        run,
+        stage="generating_recommendations",
+        message=(
+            f"Starting chat.completions.parse fallback (attempt={attempt}, model={model}, "
+            f"reasoning={reasoning_effort or 'auto'})."
+        ),
     )
     fallback_started = time.perf_counter()
     chat_parse_kwargs: dict[str, Any] = {
@@ -440,7 +671,7 @@ def _generate_with_openai(
         meta = _openai_error_meta(exc)
         logger.error(
             "Copilot run %s chat.completions.parse failed for model %s in %.2fs attempt=%s type=%s status=%s request_id=%s detail=%s body=%s",
-            run_id or "-",
+            effective_run_id or "-",
             model,
             time.perf_counter() - fallback_started,
             attempt,
@@ -449,6 +680,16 @@ def _generate_with_openai(
             meta.get("request_id") or "-",
             exc,
             meta.get("body_excerpt") or "-",
+        )
+        _append_run_event(
+            run,
+            stage="generating_recommendations",
+            kind="error",
+            message=(
+                "chat.completions.parse failed "
+                f"(type={meta.get('exception_type')}, status={meta.get('status_code')}, "
+                f"request_id={meta.get('request_id') or '-'}): {exc}"
+            ),
         )
         formatted, user_error = _format_openai_exception(exc)
         raise AICopilotError(f"Copilot generation failed: {formatted}", user_error=user_error) from exc
@@ -459,12 +700,27 @@ def _generate_with_openai(
         refusal = getattr(message, "refusal", "") if message else ""
         raise AICopilotError(refusal or "Copilot model returned no structured output.", user_error=True)
     req_id = getattr(completion, "_request_id", None)
+    output_summary = {
+        "route": "chat.completions.parse",
+        "attempt": attempt,
+        "request_id": req_id or None,
+        "recommendations": len(parsed.recommendations),
+        "metadata_variants": len(parsed.metadata_variants),
+        "recommendation_keywords": [item.keyword for item in parsed.recommendations[:8]],
+        "metadata_titles": [item.title for item in parsed.metadata_variants[:5]],
+    }
+    output_summary_json = json.dumps(output_summary, ensure_ascii=True)
     logger.warning(
-        "Copilot run %s chat.completions.parse fallback succeeded in %.2fs attempt=%s request_id=%s",
-        run_id or "-",
+        "Copilot run %s chat.completions.parse fallback succeeded in %.2fs summary=%s",
+        effective_run_id or "-",
         time.perf_counter() - fallback_started,
-        attempt,
-        req_id or "-",
+        output_summary_json,
+    )
+    _append_run_event(
+        run,
+        stage="model_output_received",
+        kind="success",
+        message=f"OpenAI response summary: {output_summary_json}",
     )
     return parsed
 
@@ -537,6 +793,12 @@ def _mark_run_failed(run: AICopilotRun, error: str):
         progress_stage="failed",
         progress_detail=_truncate_chars(str(error or "Copilot run failed."), 255),
     )
+    _append_run_event(
+        run,
+        stage="failed",
+        kind="error",
+        message=str(error or "Copilot run failed."),
+    )
 
 
 def generate_ai_copilot(
@@ -573,6 +835,14 @@ def generate_ai_copilot(
             finished_at=None,
             error="",
         )
+    _append_run_event(
+        run,
+        stage="preparing",
+        message=(
+            f"Run started for {app.name} ({country.upper()}) with model {settings_obj.model} "
+            f"and reasoning {_default_reasoning_effort_for_model(settings_obj.model, settings_obj.reasoning_effort) or 'auto'}."
+        ),
+    )
 
     try:
         _set_run_progress(
@@ -584,12 +854,28 @@ def generate_ai_copilot(
         feature_rows, feature_summary = build_keyword_feature_rows(app=app, country=country)
         if not feature_rows:
             raise AICopilotError("No tracked keyword history exists for this app and country.")
+        _append_run_event(
+            run,
+            stage="collecting_signals",
+            message=(
+                f"Collected {len(feature_rows)} feature row(s). "
+                f"Latest keyword sample: {', '.join([str(item.get('keyword')) for item in feature_rows[:6]]) or '-'}."
+            ),
+        )
 
         snapshot = _build_snapshot(app, country, feature_rows, feature_summary)
         _update_run_fields(
             run,
             input_snapshot_json=snapshot,
             feature_summary_json=feature_summary,
+        )
+        _append_run_event(
+            run,
+            stage="collecting_signals",
+            message=(
+                f"Snapshot prepared with {len(snapshot.get('feature_rows') or [])} feature row(s) and "
+                f"{len(snapshot.get('existing_keywords') or [])} existing keyword(s)."
+            ),
         )
 
         _set_run_progress(
@@ -606,12 +892,13 @@ def generate_ai_copilot(
             output = _generate_with_openai(
                 snapshot=snapshot,
                 settings_obj=settings_obj,
+                run=run,
                 run_id=run.id,
                 attempt="primary",
                 timeout_seconds=settings.OPENAI_TIMEOUT_SECONDS,
             )
         except AICopilotError as exc:
-            if _is_timeout_error(exc):
+            if _is_recoverable_generation_error(exc):
                 compact_snapshot = _compact_snapshot(
                     snapshot,
                     feature_rows_limit=SNAPSHOT_RETRY_FEATURE_ROWS_LIMIT,
@@ -627,13 +914,24 @@ def generate_ai_copilot(
                         percent=40,
                         stage="retrying_compact_prompt",
                         detail=(
-                            "Primary model request timed out. Retrying once with a smaller "
-                            "snapshot to reduce latency."
+                            "Primary model request failed with timeout/parse issue. "
+                            "Retrying once with a smaller snapshot."
+                        ),
+                    )
+                    _append_run_event(
+                        run,
+                        stage="retrying_compact_prompt",
+                        message=(
+                            f"Retrying with compact snapshot: feature_rows {len(snapshot.get('feature_rows') or [])} -> "
+                            f"{len(compact_snapshot.get('feature_rows') or [])}, existing_keywords "
+                            f"{len(snapshot.get('existing_keywords') or [])} -> "
+                            f"{len(compact_snapshot.get('existing_keywords') or [])}."
                         ),
                     )
                     output = _generate_with_openai(
                         snapshot=compact_snapshot,
                         settings_obj=settings_obj,
+                        run=run,
                         run_id=run.id,
                         attempt="compact_retry",
                         timeout_seconds=max(float(settings.OPENAI_TIMEOUT_SECONDS), 60.0),
@@ -656,6 +954,15 @@ def generate_ai_copilot(
             detail=(
                 f"Received model output: {len(output.recommendations)} recommendation candidate(s), "
                 f"{len(output.metadata_variants)} metadata variant candidate(s)."
+            ),
+        )
+        _append_run_event(
+            run,
+            stage="model_output_received",
+            kind="success",
+            message=(
+                f"Model output parsed: {len(output.recommendations)} recommendation(s), "
+                f"{len(output.metadata_variants)} metadata variant(s)."
             ),
         )
 
@@ -792,6 +1099,15 @@ def generate_ai_copilot(
                     f"{min(len(variant_objects), 3)} metadata variant(s)."
                 ),
             )
+        _append_run_event(
+            run,
+            stage="complete",
+            kind="success",
+            message=(
+                f"Saved {min(len(rec_objects), 30)} recommendation(s) and "
+                f"{min(len(variant_objects), 3)} metadata variant(s)."
+            ),
+        )
         return run
     except AICopilotError as exc:
         _mark_run_failed(run, str(exc))

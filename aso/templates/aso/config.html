@@ -38,6 +38,9 @@
             {% endif %}
         </div>
         <div class="text-xs text-slate-500">
+            Effective reasoning effort: <span class="text-slate-300">{{ effective_reasoning_effort }}</span>
+        </div>
+        <div class="text-xs text-slate-500">
             Online market context: <span class="text-slate-300">{% if effective_online_context_enabled %}Enabled{% else %}Disabled{% endif %}</span>
             · Top apps/country: <span class="text-slate-300">{{ effective_online_top_apps_per_country }}</span>
             · History rows to AI: <span class="text-slate-300">{{ effective_history_rows_max }}</span>
@@ -93,6 +96,12 @@
                 <label for="{{ form.openai_available_models.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.openai_available_models.label }}</label>
                 {{ form.openai_available_models }}
                 <p class="text-xs text-slate-500 mt-1">{{ form.openai_available_models.help_text }}</p>
+            </div>
+
+            <div>
+                <label for="{{ form.openai_reasoning_effort.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.openai_reasoning_effort.label }}</label>
+                {{ form.openai_reasoning_effort }}
+                <p class="text-xs text-slate-500 mt-1">{{ form.openai_reasoning_effort.help_text }}</p>
             </div>
 
             <div class="pt-2 border-t border-white/10">
@@ -186,6 +195,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const apiKeyInput = document.getElementById('{{ form.openai_api_key.id_for_label }}');
     const modelInput = document.getElementById('{{ form.openai_default_model.id_for_label }}');
     const availableModelsInput = document.getElementById('{{ form.openai_available_models.id_for_label }}');
+    const reasoningInput = document.getElementById('{{ form.openai_reasoning_effort.id_for_label }}');
 
     function setTestResult(message, type) {
         if (!testResult) return;
@@ -224,6 +234,7 @@ document.addEventListener('DOMContentLoaded', function() {
                         model: modelInput?.value || '',
                         api_key: apiKeyInput?.value || '',
                         available_models: availableModelsInput?.value || '',
+                        reasoning_effort: reasoningInput?.value || '',
                     }),
                 });
                 const data = await readJsonResponse(resp, 'OpenAI config test');

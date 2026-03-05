@@ -436,6 +436,12 @@ class RuntimeConfig(models.Model):
         default="",
         help_text="Comma-separated list of models shown in the AI Copilot dropdown.",
     )
+    openai_reasoning_effort = models.CharField(
+        max_length=16,
+        blank=True,
+        default="",
+        help_text="Default reasoning effort for OpenAI requests (blank = auto).",
+    )
     ai_system_prompt = models.TextField(blank=True, default="")
     ai_user_prompt_template = models.TextField(blank=True, default="")
     ai_enable_online_context = models.BooleanField(
@@ -573,6 +579,7 @@ class AICopilotRun(models.Model):
     country = models.CharField(max_length=5, default="us")
     input_snapshot_json = models.JSONField(default=dict)
     feature_summary_json = models.JSONField(default=dict)
+    events_json = models.JSONField(default=list)
     error = models.TextField(blank=True, default="")
     started_at = models.DateTimeField(auto_now_add=True)
     finished_at = models.DateTimeField(null=True, blank=True)

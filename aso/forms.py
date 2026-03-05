@@ -65,6 +65,16 @@ COUNTRY_CHOICES = [
     ("tw", "🇹🇼 Taiwan"),
 ]
 
+OPENAI_REASONING_CHOICES = [
+    ("", "Auto"),
+    ("none", "None"),
+    ("minimal", "Minimal"),
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("high", "High"),
+    ("xhigh", "XHigh"),
+]
+
 
 class KeywordSearchForm(forms.Form):
     """Form for searching keywords."""
@@ -163,6 +173,17 @@ class RuntimeConfigForm(forms.Form):
         ),
         label="Available Models",
         help_text="Comma-separated models shown in the AI Copilot model dropdown.",
+    )
+    openai_reasoning_effort = forms.ChoiceField(
+        required=False,
+        choices=OPENAI_REASONING_CHOICES,
+        widget=forms.Select(
+            attrs={
+                "class": "w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-purple-500",
+            }
+        ),
+        label="Default Reasoning Effort",
+        help_text="Blank uses model defaults. Lower effort is usually faster.",
     )
     ai_enable_online_context = forms.BooleanField(
         required=False,
@@ -289,6 +310,7 @@ class RuntimeConfigForm(forms.Form):
         ]
         self.fields["openai_default_model"].initial = default_model
         self.fields["openai_available_models"].initial = available_model_csv
+        self.fields["openai_reasoning_effort"].initial = (config.openai_reasoning_effort or "").strip().lower()
         if config.ai_enable_online_context is None:
             self.fields["ai_enable_online_context"].initial = settings.AI_ENABLE_ONLINE_CONTEXT
         else:
@@ -321,6 +343,9 @@ class RuntimeConfigForm(forms.Form):
         self.config.openai_available_models = (
             self.cleaned_data.get("openai_available_models") or ""
         ).strip()
+        self.config.openai_reasoning_effort = (
+            self.cleaned_data.get("openai_reasoning_effort") or ""
+        ).strip().lower()
         self.config.ai_enable_online_context = self.cleaned_data.get("ai_enable_online_context")
         self.config.ai_online_top_apps_per_country = self.cleaned_data.get("ai_online_top_apps_per_country")
         self.config.ai_history_rows_max = self.cleaned_data.get("ai_history_rows_max")

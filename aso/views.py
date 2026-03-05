@@ -14,7 +14,14 @@ from django.utils import timezone
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
 
-from .forms import AppForm, KeywordSearchForm, OpportunitySearchForm, RuntimeConfigForm, COUNTRY_CHOICES
+from .forms import (
+    AppForm,
+    COUNTRY_CHOICES,
+    KeywordSearchForm,
+    OPENAI_REASONING_CHOICES,
+    OpportunitySearchForm,
+    RuntimeConfigForm,
+)
 from .models import (
     ASCMetricDaily,
     ASCSyncRun,
@@ -56,6 +63,24 @@ from .refresh_service import run_refresh
 logger = logging.getLogger(__name__)
 BULK_REFRESH_STALE_HOURS = 4
 COPILOT_STALE_MINUTES = 45
+COPILOT_MAX_EVENT_LOG_ENTRIES = 120
+
+
+def _append_copilot_run_event(*, run_id: int, stage: str, message: str, kind: str = "info") -> None:
+    row = AICopilotRun.objects.filter(pk=run_id).values("events_json").first()
+    if not row:
+        return
+    events = list(row.get("events_json") or [])
+    events.append(
+        {
+            "ts": timezone.now().isoformat(),
+            "stage": str(stage or "info")[:64],
+            "kind": str(kind or "info")[:16],
+            "message": str(message or "")[:500],
+        }
+    )
+    events = events[-COPILOT_MAX_EVENT_LOG_ENTRIES:]
+    AICopilotRun.objects.filter(pk=run_id).update(events_json=events)
 
 
 def _run_bulk_refresh_in_background(*, run_id: int, pairs: list[tuple[int, str]]) -> None:
@@ -90,6 +115,12 @@ def _mark_copilot_run_failed(*, run_id: int, message: str) -> None:
         progress_stage="failed",
         progress_detail=str(message or "Copilot run failed.")[:255],
     )
+    _append_copilot_run_event(
+        run_id=run_id,
+        stage="failed",
+        kind="error",
+        message=str(message or "Copilot run failed."),
+    )
 
 
 def _run_copilot_in_background(
@@ -105,12 +136,25 @@ def _run_copilot_in_background(
     try:
         app = App.objects.get(pk=app_id)
         run = AICopilotRun.objects.get(pk=run_id)
+        _append_copilot_run_event(
+            run_id=run_id,
+            stage="queued",
+            message=(
+                f"Background worker started for app {app.name} "
+                f"({country.upper()}) using model {model}."
+            ),
+        )
 
         if sync_asc:
             AICopilotRun.objects.filter(pk=run_id, status=AICopilotRun.STATUS_RUNNING).update(
                 progress_percent=8,
                 progress_stage="syncing_asc",
                 progress_detail="Syncing App Store Connect analytics before generation.",
+            )
+            _append_copilot_run_event(
+                run_id=run_id,
+                stage="syncing_asc",
+                message="Syncing App Store Connect analytics before model generation.",
             )
             resolved_asc_app_id = _effective_asc_app_id(app)
             if not resolved_asc_app_id:
@@ -134,6 +178,12 @@ def _run_copilot_in_background(
                 asc_run.finished_at = timezone.now()
                 asc_run.error = ""
                 asc_run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
+                _append_copilot_run_event(
+                    run_id=run_id,
+                    stage="syncing_asc",
+                    kind="success",
+                    message=f"ASC sync completed with {rows_upserted} row(s) upserted.",
+                )
             except (ASCAuthError, ASCError, ASCAPIError) as exc:
                 logger.warning(
                     "ASC pre-sync failed during background copilot run for app=%s asc_app_id=%s: %s",
@@ -151,6 +201,12 @@ def _run_copilot_in_background(
                     progress_stage="asc_sync_failed",
                     progress_detail=f"ASC pre-sync failed ({exc}); continuing with existing data."[:255],
                 )
+                _append_copilot_run_event(
+                    run_id=run_id,
+                    stage="asc_sync_failed",
+                    kind="error",
+                    message=f"ASC pre-sync failed: {exc}. Continuing with existing ASC data.",
+                )
             except Exception as exc:
                 logger.exception(
                     "ASC pre-sync crashed during background copilot run for app=%s asc_app_id=%s",
@@ -167,8 +223,19 @@ def _run_copilot_in_background(
                     progress_stage="asc_sync_failed",
                     progress_detail="ASC pre-sync failed unexpectedly; continuing with existing data.",
                 )
+                _append_copilot_run_event(
+                    run_id=run_id,
+                    stage="asc_sync_failed",
+                    kind="error",
+                    message="ASC pre-sync failed unexpectedly. Continuing with existing ASC data.",
+                )
 
         run.refresh_from_db()
+        _append_copilot_run_event(
+            run_id=run_id,
+            stage="preparing",
+            message="Starting AI copilot generation pipeline.",
+        )
         generate_ai_copilot(
             app,
             country=country,
@@ -177,6 +244,7 @@ def _run_copilot_in_background(
                 api_key=effective_settings["api_key"],
                 system_prompt=effective_settings["system_prompt"],
                 user_prompt_template=effective_settings["user_prompt_template"],
+                reasoning_effort=effective_settings.get("reasoning_effort", ""),
             ),
             run=run,
         )
@@ -253,6 +321,7 @@ def config_view(request):
             "api_key_source": effective["api_key_source"],
             "effective_default_model": effective["default_model"],
             "effective_available_models": effective["available_models"],
+            "effective_reasoning_effort": effective["reasoning_effort"] or "auto",
             "effective_online_context_enabled": effective["enable_online_context"],
             "effective_online_top_apps_per_country": effective["online_top_apps_per_country"],
             "effective_history_rows_max": effective["history_rows_max"],
@@ -364,6 +433,12 @@ def config_openai_test_view(request):
         )
     except AISuggestionError as exc:
         return JsonResponse({"success": False, "error": str(exc), "error_kind": "invalid_model"}, status=400)
+    try:
+        selected_reasoning_effort = _resolve_reasoning_effort_choice(
+            body.get("reasoning_effort") if body.get("reasoning_effort") is not None else effective["reasoning_effort"]
+        )
+    except AISuggestionError as exc:
+        return JsonResponse({"success": False, "error": str(exc), "error_kind": "invalid_reasoning"}, status=400)
 
     try:
         from openai import OpenAI
@@ -388,17 +463,19 @@ def config_openai_test_view(request):
         response = client.with_options(
             timeout=min(float(settings.OPENAI_TIMEOUT_SECONDS), 30.0),
             max_retries=settings.OPENAI_MAX_RETRIES,
-        ).responses.create(
-            model=selected_model,
-            input="Reply with a short confirmation that this model is reachable.",
-            max_output_tokens=32,
-        )
+        ).responses.create(**{
+            "model": selected_model,
+            "input": "Reply with a short confirmation that this model is reachable.",
+            "max_output_tokens": 32,
+            **({"reasoning": {"effort": selected_reasoning_effort}} if selected_reasoning_effort else {}),
+        })
         elapsed = round(time.perf_counter() - started, 2)
         output_text = (getattr(response, "output_text", "") or "").strip()
         request_id = getattr(response, "_request_id", None)
         logger.warning(
-            "OpenAI config test succeeded model=%s request_id=%s elapsed=%.2fs output=%s",
+            "OpenAI config test succeeded model=%s reasoning=%s request_id=%s elapsed=%.2fs output=%s",
             selected_model,
+            selected_reasoning_effort or "auto",
             request_id or "-",
             elapsed,
             output_text[:120] or "-",
@@ -410,15 +487,18 @@ def config_openai_test_view(request):
                 "elapsed_seconds": elapsed,
                 "request_id": request_id,
                 "output_preview": output_text[:240],
+                "reasoning_effort": selected_reasoning_effort or "auto",
             }
         )
     except Exception as exc:
         payload, http_status = _openai_test_error_payload(exc)
         payload["model"] = selected_model
+        payload["reasoning_effort"] = selected_reasoning_effort or "auto"
         payload["elapsed_seconds"] = round(time.perf_counter() - started, 2)
         logger.warning(
-            "OpenAI config test failed model=%s kind=%s status=%s request_id=%s detail=%s",
+            "OpenAI config test failed model=%s reasoning=%s kind=%s status=%s request_id=%s detail=%s",
             selected_model,
+            selected_reasoning_effort or "auto",
             payload.get("error_kind"),
             payload.get("status_code"),
             payload.get("request_id") or "-",
@@ -1431,10 +1511,10 @@ def _serialize_copilot_metadata_variant(variant: AICopilotMetadataVariant):
     }
 
 
-def _serialize_copilot_run(run: AICopilotRun | None):
+def _serialize_copilot_run(run: AICopilotRun | None, *, include_events: bool = False):
     if not run:
         return None
-    return {
+    payload = {
         "id": run.id,
         "status": run.status,
         "progress_percent": int(run.progress_percent or 0),
@@ -1446,6 +1526,9 @@ def _serialize_copilot_run(run: AICopilotRun | None):
         "finished_at": run.finished_at.isoformat() if run.finished_at else None,
         "error": run.error,
     }
+    if include_events:
+        payload["events"] = list(run.events_json or [])[-120:]
+    return payload
 
 
 def _serialize_asc_sync_run(run: ASCSyncRun | None):
@@ -1553,6 +1636,9 @@ def _effective_ai_settings() -> dict:
         available_models.insert(0, default_model)
     if not available_models and default_model:
         available_models = [default_model]
+    raw_reasoning_effort = (runtime.openai_reasoning_effort or "").strip().lower()
+    allowed_reasoning_efforts = {value for value, _label in OPENAI_REASONING_CHOICES}
+    reasoning_effort = raw_reasoning_effort if raw_reasoning_effort in allowed_reasoning_efforts else ""
     system_prompt = runtime.ai_system_prompt.strip() or settings.AI_SYSTEM_PROMPT
     user_prompt_template = runtime.ai_user_prompt_template.strip() or settings.AI_USER_PROMPT_TEMPLATE
     if runtime.ai_enable_online_context is None:
@@ -1591,6 +1677,7 @@ def _effective_ai_settings() -> dict:
         "default_model": default_model,
         "available_models": available_models,
         "api_key_source": api_key_source,
+        "reasoning_effort": reasoning_effort,
         "system_prompt": system_prompt,
         "user_prompt_template": user_prompt_template,
         "enable_online_context": enable_online_context,
@@ -1616,6 +1703,14 @@ def _resolve_model_choice(model_raw, *, default_model: str, allowed_models: list
             f"Model '{model}' is not allowed. Configure allowed models on the Config page."
         )
     return model
+
+
+def _resolve_reasoning_effort_choice(reasoning_raw):
+    value = str(reasoning_raw or "").strip().lower()
+    valid_values = {item[0] for item in OPENAI_REASONING_CHOICES}
+    if value not in valid_values:
+        raise AISuggestionError("Invalid reasoning effort.")
+    return value
 
 
 def ai_suggestions_view(request):
@@ -1646,6 +1741,8 @@ def ai_suggestions_view(request):
             "selected_app": selected_app_id,
             "available_models": effective["available_models"],
             "default_model": effective["default_model"],
+            "reasoning_choices": OPENAI_REASONING_CHOICES,
+            "default_reasoning_effort": effective["reasoning_effort"],
             "country_choices": COUNTRY_CHOICES,
             "selected_country": selected_country,
             "asc_configured": effective["asc_configured"],
@@ -1869,7 +1966,7 @@ def ai_copilot_status_view(request):
     return JsonResponse(
         {
             "app_id": app.id,
-            "run": _serialize_copilot_run(run),
+            "run": _serialize_copilot_run(run, include_events=True),
             "has_running_run": bool(run and run.status == AICopilotRun.STATUS_RUNNING),
         }
     )
@@ -1889,6 +1986,7 @@ def ai_copilot_generate_view(request):
 
     country = body.get("country")
     model = body.get("model")
+    reasoning_effort = body.get("reasoning_effort")
     sync_asc = bool(body.get("sync_asc", False))
     effective = _effective_ai_settings()
 
@@ -1898,6 +1996,9 @@ def ai_copilot_generate_view(request):
             model,
             default_model=effective["default_model"],
             allowed_models=effective["available_models"],
+        )
+        selected_reasoning_effort = _resolve_reasoning_effort_choice(
+            reasoning_effort if reasoning_effort is not None else effective["reasoning_effort"]
         )
         if sync_asc and not effective["asc_configured"]:
             raise AICopilotError("App Store Connect credentials are not configured.")
@@ -1943,6 +2044,17 @@ def ai_copilot_generate_view(request):
             country=selected_country,
             input_snapshot_json={},
             feature_summary_json={},
+            events_json=[
+                {
+                    "ts": timezone.now().isoformat(),
+                    "stage": "queued",
+                    "kind": "info",
+                    "message": (
+                        f"Run queued for app {app.name} ({selected_country.upper()}) "
+                        f"with model {selected_model} and reasoning {selected_reasoning_effort or 'auto'}."
+                    ),
+                }
+            ],
         )
 
         _start_copilot_background_run(
@@ -1955,6 +2067,7 @@ def ai_copilot_generate_view(request):
                 "api_key": effective["api_key"],
                 "system_prompt": effective["system_prompt"],
                 "user_prompt_template": effective["user_prompt_template"],
+                "reasoning_effort": selected_reasoning_effort,
                 "asc_key_id": effective["asc_key_id"],
                 "asc_issuer_id": effective["asc_issuer_id"],
                 "asc_private_key": effective["asc_private_key"],

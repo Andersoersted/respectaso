@@ -13,7 +13,7 @@
     </div>
 
     <div class="bg-[#1e293b] border border-white/10 rounded-xl p-4">
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+        <div class="grid grid-cols-1 md:grid-cols-5 gap-3">
             <div class="md:col-span-1">
                 <label for="ai-app-select" class="block text-xs font-medium text-slate-300 mb-1.5">App</label>
                 <select id="ai-app-select" class="w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500">
@@ -36,6 +36,14 @@
                 <select id="ai-model-select" class="w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500">
                     {% for model in available_models %}
                     <option value="{{ model }}" {% if model == default_model %}selected{% endif %}>{{ model }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="md:col-span-1">
+                <label for="ai-reasoning-select" class="block text-xs font-medium text-slate-300 mb-1.5">Reasoning</label>
+                <select id="ai-reasoning-select" class="w-full bg-slate-700 border border-white/10 rounded-lg px-3 py-2.5 text-sm text-white focus:outline-none focus:ring-2 focus:ring-purple-500">
+                    {% for value, label in reasoning_choices %}
+                    <option value="{{ value }}" {% if value == default_reasoning_effort %}selected{% endif %}>{{ label }}</option>
                     {% endfor %}
                 </select>
             </div>
@@ -75,6 +83,16 @@
             <div id="ai-progress-bar" class="h-full rounded-full bg-gradient-to-r from-cyan-500 to-purple-500 transition-all duration-500" style="width: 0%"></div>
         </div>
         <p id="ai-progress-detail" class="text-xs text-slate-400 mt-2">Building keyword snapshot and validating inputs.</p>
+    </div>
+
+    <div id="ai-activity" class="hidden bg-slate-800/50 border border-white/10 rounded-xl p-3">
+        <div class="flex items-center justify-between">
+            <h3 class="text-xs font-semibold text-slate-200 uppercase tracking-wide">Copilot Activity</h3>
+            <span class="text-[11px] text-slate-500">Live run timeline</span>
+        </div>
+        <ul id="ai-activity-list" class="mt-2 space-y-1.5 max-h-56 overflow-y-auto text-xs text-slate-300">
+            <li class="text-slate-500">Start a run to see request/response activity.</li>
+        </ul>
     </div>
 
     <div class="bg-[#1e293b] border border-white/10 rounded-xl overflow-hidden">
@@ -179,6 +197,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const appSelect = document.getElementById('ai-app-select');
     const countrySelect = document.getElementById('ai-country-select');
     const modelSelect = document.getElementById('ai-model-select');
+    const reasoningSelect = document.getElementById('ai-reasoning-select');
     const syncBtn = document.getElementById('asc-sync-btn');
     const generateBtn = document.getElementById('ai-generate-btn');
     const statusEl = document.getElementById('ai-status');
@@ -188,6 +207,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const progressBarEl = document.getElementById('ai-progress-bar');
     const progressTrackEl = progressBarEl?.parentElement;
     const progressDetailEl = document.getElementById('ai-progress-detail');
+    const activityEl = document.getElementById('ai-activity');
+    const activityListEl = document.getElementById('ai-activity-list');
     const recoBody = document.getElementById('copilot-recommendations-body');
     const metadataBody = document.getElementById('copilot-metadata-body');
     const runsBody = document.getElementById('copilot-runs-body');
@@ -204,6 +225,7 @@ document.addEventListener('DOMContentLoaded', () => {
         preparing: 'Preparing run',
         collecting_signals: 'Collecting keyword signals',
         generating_recommendations: 'Generating AI recommendations',
+        retrying_reasoning: 'Retrying with compatible reasoning',
         retrying_compact_prompt: 'Retrying with compact prompt',
         model_output_received: 'Model output received',
         scoring_recommendations: 'Scoring recommendations',
@@ -268,6 +290,25 @@ document.addEventListener('DOMContentLoaded', () => {
         return COPILOT_STAGE_LABELS[key] || key.replace(/_/g, ' ').replace(/\b\w/g, (m) => m.toUpperCase()) || 'Running';
     }
 
+    function renderRunEvents(events) {
+        if (!activityEl || !activityListEl) return;
+        const list = Array.isArray(events) ? events : [];
+        if (!list.length) {
+            activityEl.classList.remove('hidden');
+            activityListEl.innerHTML = '<li class="text-slate-500">Waiting for activity logs...</li>';
+            return;
+        }
+        activityEl.classList.remove('hidden');
+        activityListEl.innerHTML = list.slice(-80).reverse().map((item) => {
+            const ts = item?.ts ? new Date(item.ts).toLocaleTimeString() : '--:--:--';
+            const stage = item?.stage ? stageLabel(item.stage) : 'Info';
+            const kind = String(item?.kind || 'info').toLowerCase();
+            const tone = kind === 'error' ? 'text-red-300' : (kind === 'success' ? 'text-green-300' : 'text-slate-300');
+            const message = item?.message || 'No details.';
+            return `<li class="${tone}"><span class="text-slate-500 mr-1">[${ts}]</span><span class="text-slate-400 mr-1">${stage}:</span>${message}</li>`;
+        }).join('');
+    }
+
     function isRunTerminal(run) {
         if (!run || !run.status) return false;
         return String(run.status).toLowerCase() !== 'running';
@@ -316,6 +357,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
             progressPollRunId = run.id;
             progressLastRun = run;
+            updateRunRow(run);
+            renderRunEvents(run.events || []);
             setProgress(
                 Number(run.progress_percent || 0),
                 stageLabel(run.progress_stage || run.status),
@@ -353,6 +396,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function startCopilotProgress(appId) {
         progressValue = 0;
+        renderRunEvents([]);
         beginProgressPolling(appId, {
             id: null,
             status: 'running',
@@ -466,8 +510,12 @@ document.addEventListener('DOMContentLoaded', () => {
             runsBody.innerHTML = '<tr><td colspan="6" class="px-3 py-5 text-sm text-slate-500 text-center">No runs yet.</td></tr>';
             return;
         }
-        runsBody.innerHTML = runs.map((run) => `
-            <tr class="border-b border-white/5">
+        runsBody.innerHTML = runs.map((run) => runRowHtml(run)).join('');
+    }
+
+    function runRowHtml(run) {
+        return `
+            <tr class="border-b border-white/5" data-run-id="${run.id}">
                 <td class="px-3 py-2 text-xs text-slate-300">#${run.id}</td>
                 <td class="px-3 py-2 text-xs text-slate-300">${run.status}${run.status === 'running' ? ` (${run.progress_percent || 0}%)` : ''}</td>
                 <td class="px-3 py-2 text-xs text-slate-300">${run.model}</td>
@@ -475,7 +523,25 @@ document.addEventListener('DOMContentLoaded', () => {
                 <td class="px-3 py-2 text-xs text-slate-300">${run.started_at ? new Date(run.started_at).toLocaleString() : '—'}</td>
                 <td class="px-3 py-2 text-xs ${run.error ? 'text-red-300' : 'text-slate-400'}">${run.error || run.progress_detail || '—'}</td>
             </tr>
-        `).join('');
+        `;
+    }
+
+    function updateRunRow(run) {
+        if (!run || !run.id) return;
+        const nextHtml = runRowHtml(run).trim();
+        const existingRow = runsBody.querySelector(`tr[data-run-id="${run.id}"]`);
+        const tpl = document.createElement('template');
+        tpl.innerHTML = nextHtml;
+        const nextRow = tpl.content.firstElementChild;
+        if (!nextRow) return;
+
+        if (existingRow) {
+            existingRow.replaceWith(nextRow);
+            return;
+        }
+        const placeholderRow = runsBody.querySelector('tr td[colspan="6"]');
+        if (placeholderRow) runsBody.innerHTML = '';
+        runsBody.prepend(nextRow);
     }
 
     function renderASCStatus(status) {
@@ -504,6 +570,7 @@ document.addEventListener('DOMContentLoaded', () => {
             progressPollRunId = null;
             progressLastRun = null;
             progressEl.classList.add('hidden');
+            activityEl?.classList.add('hidden');
             renderRecommendations([]);
             renderMetadataVariants([]);
             renderRuns([]);
@@ -525,6 +592,12 @@ document.addEventListener('DOMContentLoaded', () => {
             if (hasRunningRun) {
                 beginProgressPolling(appId, latestRun);
                 setStatus(`Resumed Copilot run #${latestRun.id}.`, 'info');
+            } else {
+                stopProgressPolling();
+                progressPollRunId = null;
+                progressLastRun = latestRun || null;
+                progressEl.classList.add('hidden');
+                activityEl?.classList.add('hidden');
             }
             setStatus(`Loaded copilot data for ${data.app?.name || 'app'}.`, 'info');
         } catch (err) {
@@ -546,6 +619,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify({
                     app_id: Number(appId),
                     model: modelSelect.value,
+                    reasoning_effort: reasoningSelect?.value || '',
                     country: countrySelect.value,
                     sync_asc: false,
                 }),

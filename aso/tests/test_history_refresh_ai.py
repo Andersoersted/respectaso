@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import ANY, patch
 
 from django.core.management import call_command
@@ -16,6 +17,7 @@ from aso.copilot_ai_service import (
     CopilotSettings,
     MetadataVariantOut,
     RecommendationOut,
+    _generate_with_openai,
     generate_ai_copilot,
 )
 from aso.models import (
@@ -800,6 +802,8 @@ class AICopilotEndpointTests(TestCase):
         payload = response.json()
         self.assertEqual(payload["app_id"], self.app.id)
         self.assertEqual(payload["run"]["id"], self.run.id)
+        self.assertIn("events", payload["run"])
+        self.assertIsInstance(payload["run"]["events"], list)
 
     @patch("aso.views._start_copilot_background_run")
     def test_generate_endpoint_returns_run_payload(self, mock_start):
@@ -814,6 +818,25 @@ class AICopilotEndpointTests(TestCase):
         self.assertTrue(payload["has_running_run"])
         self.assertEqual(payload["run"]["status"], AICopilotRun.STATUS_RUNNING)
         mock_start.assert_called_once()
+
+    @patch("aso.views._start_copilot_background_run")
+    def test_generate_endpoint_passes_reasoning_effort_to_background(self, mock_start):
+        response = self.client.post(
+            reverse("aso:ai_copilot_generate"),
+            data=json.dumps(
+                {
+                    "app_id": self.app.id,
+                    "country": "us",
+                    "model": "gpt-5-mini",
+                    "reasoning_effort": "medium",
+                }
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 202)
+        mock_start.assert_called_once()
+        kwargs = mock_start.call_args.kwargs
+        self.assertEqual(kwargs["effective_settings"]["reasoning_effort"], "medium")
 
     @patch("aso.views._start_copilot_background_run")
     def test_generate_endpoint_returns_conflict_when_run_is_already_running(self, mock_start):
@@ -975,3 +998,84 @@ class AICopilotServiceTimeoutRetryTests(TestCase):
             len(first_snapshot.get("existing_keywords") or []),
             len(second_snapshot.get("existing_keywords") or []),
         )
+
+
+class AICopilotOpenAIRequestTests(TestCase):
+    @patch("aso.copilot_ai_service._build_openai_client")
+    def test_generate_with_openai_uses_low_reasoning_for_gpt5_models(self, mock_build_client):
+        class DummyResponses:
+            def __init__(self):
+                self.kwargs = None
+
+            def parse(self, **kwargs):
+                self.kwargs = kwargs
+                return SimpleNamespace(output_parsed=CopilotOutput())
+
+        class DummyClient:
+            def __init__(self):
+                self.responses = DummyResponses()
+
+            def with_options(self, **_kwargs):
+                return self
+
+        dummy = DummyClient()
+        mock_build_client.return_value = dummy
+
+        _generate_with_openai(
+            snapshot={
+                "feature_rows": [{"keyword": "one"}],
+                "existing_keywords": ["one"],
+            },
+            settings_obj=CopilotSettings(
+                model="gpt-5-mini",
+                api_key="sk-test-123",
+                system_prompt="System",
+                user_prompt_template="{{SNAPSHOT_JSON}}",
+            ),
+            run_id=123,
+            attempt="primary",
+            timeout_seconds=20.0,
+        )
+
+        self.assertIsNotNone(dummy.responses.kwargs)
+        self.assertEqual(dummy.responses.kwargs.get("reasoning", {}).get("effort"), "low")
+
+    @patch("aso.copilot_ai_service._build_openai_client")
+    def test_generate_with_openai_respects_configured_reasoning_effort(self, mock_build_client):
+        class DummyResponses:
+            def __init__(self):
+                self.kwargs = None
+
+            def parse(self, **kwargs):
+                self.kwargs = kwargs
+                return SimpleNamespace(output_parsed=CopilotOutput())
+
+        class DummyClient:
+            def __init__(self):
+                self.responses = DummyResponses()
+
+            def with_options(self, **_kwargs):
+                return self
+
+        dummy = DummyClient()
+        mock_build_client.return_value = dummy
+
+        _generate_with_openai(
+            snapshot={
+                "feature_rows": [{"keyword": "one"}],
+                "existing_keywords": ["one"],
+            },
+            settings_obj=CopilotSettings(
+                model="gpt-5-mini",
+                api_key="sk-test-123",
+                system_prompt="System",
+                user_prompt_template="{{SNAPSHOT_JSON}}",
+                reasoning_effort="high",
+            ),
+            run_id=123,
+            attempt="primary",
+            timeout_seconds=20.0,
+        )
+
+        self.assertIsNotNone(dummy.responses.kwargs)
+        self.assertEqual(dummy.responses.kwargs.get("reasoning", {}).get("effort"), "high")
