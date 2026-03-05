@@ -116,18 +116,54 @@ def run_refresh(
     source: str = SearchResult.SOURCE_DAILY_REFRESH,
     force: bool = False,
     throttle_seconds: float = 2.0,
+    pairs_override: list[tuple[int, str]] | None = None,
+    run_id: int | None = None,
 ) -> RefreshRun:
     """
     Refresh tracked keyword-country pairs and persist progress in RefreshRun.
     """
-    pairs = get_pairs_to_refresh(force=force)
-    run = RefreshRun.objects.create(
-        trigger=trigger,
-        status=RefreshRun.STATUS_RUNNING,
-        total=len(pairs),
-        completed=0,
-        current_keyword="",
-    )
+    if pairs_override is None:
+        pairs = get_pairs_to_refresh(force=force)
+    else:
+        # De-duplicate while preserving caller ordering.
+        seen: set[tuple[int, str]] = set()
+        pairs: list[tuple[int, str]] = []
+        for keyword_id, country in pairs_override:
+            pair = (int(keyword_id), str(country or "us").lower())
+            if pair in seen:
+                continue
+            seen.add(pair)
+            pairs.append(pair)
+
+    if run_id is None:
+        run = RefreshRun.objects.create(
+            trigger=trigger,
+            status=RefreshRun.STATUS_RUNNING,
+            total=len(pairs),
+            completed=0,
+            current_keyword="",
+            error="",
+        )
+    else:
+        run = RefreshRun.objects.get(pk=run_id)
+        run.trigger = trigger
+        run.status = RefreshRun.STATUS_RUNNING
+        run.total = len(pairs)
+        run.completed = 0
+        run.current_keyword = ""
+        run.finished_at = None
+        run.error = ""
+        run.save(
+            update_fields=[
+                "trigger",
+                "status",
+                "total",
+                "completed",
+                "current_keyword",
+                "finished_at",
+                "error",
+            ]
+        )
 
     if not pairs:
         run.status = RefreshRun.STATUS_SUCCESS
@@ -204,4 +240,3 @@ def run_refresh(
 
     cleanup_old_results()
     return run
-

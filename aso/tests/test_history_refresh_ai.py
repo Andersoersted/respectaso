@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from unittest.mock import ANY, patch
 
@@ -140,6 +141,187 @@ class RefreshCommandTests(TestCase):
             SearchResult.objects.filter(source=SearchResult.SOURCE_DAILY_REFRESH).count(),
             1,
         )
+
+
+class DashboardRankVisibilityTests(TestCase):
+    def _snapshot(self, keyword: Keyword, *, country: str = "us", app_rank: int | None = None):
+        return SearchResult.create_snapshot(
+            keyword=keyword,
+            country=country,
+            source=SearchResult.SOURCE_MANUAL_SEARCH,
+            popularity_score=25,
+            difficulty_score=45,
+            difficulty_breakdown={},
+            competitors_data=[],
+            app_rank=app_rank,
+        )
+
+    def test_show_rank_true_for_all_apps_when_trackable_rows_exist(self):
+        app = App.objects.create(name="Trackable", track_id=123456)
+        kw = Keyword.objects.create(keyword="trackable term", app=app)
+        self._snapshot(kw, app_rank=None)
+
+        response = self.client.get(reverse("aso:dashboard"))
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.context["show_rank"])
+
+    def test_show_rank_false_for_all_apps_without_trackable_or_rank(self):
+        kw = Keyword.objects.create(keyword="manual term")
+        self._snapshot(kw, app_rank=None)
+
+        response = self.client.get(reverse("aso:dashboard"))
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.context["show_rank"])
+
+    def test_show_rank_true_for_filtered_app_when_rank_data_exists(self):
+        app = App.objects.create(name="Manual App")
+        kw = Keyword.objects.create(keyword="ranked term", app=app)
+        self._snapshot(kw, app_rank=23)
+
+        response = self.client.get(reverse("aso:dashboard"), {"app": app.id})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.context["show_rank"])
+
+
+class BulkRefreshAsyncEndpointTests(TestCase):
+    def _snapshot(self, keyword: Keyword, *, country: str):
+        return SearchResult.create_snapshot(
+            keyword=keyword,
+            country=country,
+            source=SearchResult.SOURCE_MANUAL_SEARCH,
+            popularity_score=33,
+            difficulty_score=44,
+            difficulty_breakdown={},
+            competitors_data=[],
+            app_rank=None,
+        )
+
+    @patch("aso.views.threading.Thread")
+    def test_bulk_refresh_starts_async_with_all_apps_scope(self, mock_thread):
+        app_a = App.objects.create(name="App A", track_id=111)
+        app_b = App.objects.create(name="App B", track_id=222)
+        kw_a = Keyword.objects.create(keyword="alpha", app=app_a)
+        kw_b = Keyword.objects.create(keyword="beta", app=app_b)
+        kw_c = Keyword.objects.create(keyword="gamma")
+        self._snapshot(kw_a, country="us")
+        self._snapshot(kw_a, country="gb")
+        self._snapshot(kw_b, country="us")
+
+        response = self.client.post(
+            reverse("aso:keywords_bulk_refresh"),
+            data='{"app_id": null}',
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["success"])
+        self.assertTrue(payload["started"])
+        self.assertEqual(payload["total_pairs"], 4)
+        self.assertIn("run_id", payload)
+
+        run = RefreshRun.objects.get(pk=payload["run_id"])
+        self.assertEqual(run.status, RefreshRun.STATUS_RUNNING)
+        self.assertEqual(run.total, 4)
+
+        mock_thread.assert_called_once()
+        thread_kwargs = mock_thread.call_args.kwargs["kwargs"]
+        self.assertEqual(thread_kwargs["run_id"], run.id)
+        self.assertEqual(
+            set(thread_kwargs["pairs"]),
+            {
+                (kw_a.id, "us"),
+                (kw_a.id, "gb"),
+                (kw_b.id, "us"),
+                (kw_c.id, "us"),
+            },
+        )
+
+    @patch("aso.views.threading.Thread")
+    def test_bulk_refresh_selected_app_scope_only(self, mock_thread):
+        app_a = App.objects.create(name="App A", track_id=111)
+        app_b = App.objects.create(name="App B", track_id=222)
+        kw_a = Keyword.objects.create(keyword="alpha", app=app_a)
+        kw_b = Keyword.objects.create(keyword="beta", app=app_b)
+        self._snapshot(kw_a, country="us")
+        self._snapshot(kw_a, country="gb")
+        self._snapshot(kw_b, country="us")
+
+        response = self.client.post(
+            reverse("aso:keywords_bulk_refresh"),
+            data='{"app_id": %d}' % app_a.id,
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["started"])
+        self.assertEqual(payload["total_pairs"], 2)
+
+        thread_kwargs = mock_thread.call_args.kwargs["kwargs"]
+        self.assertEqual(set(thread_kwargs["pairs"]), {(kw_a.id, "us"), (kw_a.id, "gb")})
+
+    @patch("aso.views.threading.Thread")
+    def test_bulk_refresh_returns_not_started_when_no_keywords(self, mock_thread):
+        response = self.client.post(
+            reverse("aso:keywords_bulk_refresh"),
+            data='{"app_id": 999999}',
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["success"])
+        self.assertFalse(payload["started"])
+        self.assertEqual(payload["total_pairs"], 0)
+        mock_thread.assert_not_called()
+
+    def test_bulk_refresh_returns_409_when_non_stale_run_exists(self):
+        RefreshRun.objects.create(
+            trigger=RefreshRun.TRIGGER_MANUAL,
+            status=RefreshRun.STATUS_RUNNING,
+            total=1,
+            completed=0,
+            current_keyword="alpha (US)",
+        )
+        app = App.objects.create(name="App A", track_id=111)
+        kw = Keyword.objects.create(keyword="alpha", app=app)
+        self._snapshot(kw, country="us")
+
+        response = self.client.post(
+            reverse("aso:keywords_bulk_refresh"),
+            data='{"app_id": null}',
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 409)
+        payload = response.json()
+        self.assertFalse(payload["success"])
+
+    @patch("aso.views.threading.Thread")
+    def test_bulk_refresh_marks_stale_run_failed_and_starts_new(self, mock_thread):
+        stale = RefreshRun.objects.create(
+            trigger=RefreshRun.TRIGGER_MANUAL,
+            status=RefreshRun.STATUS_RUNNING,
+            total=2,
+            completed=1,
+            current_keyword="stale (US)",
+        )
+        stale_time = timezone.now() - timedelta(hours=5)
+        RefreshRun.objects.filter(pk=stale.pk).update(started_at=stale_time)
+
+        app = App.objects.create(name="App A", track_id=111)
+        kw = Keyword.objects.create(keyword="alpha", app=app)
+        self._snapshot(kw, country="us")
+
+        response = self.client.post(
+            reverse("aso:keywords_bulk_refresh"),
+            data='{"app_id": null}',
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["started"])
+
+        stale.refresh_from_db()
+        self.assertEqual(stale.status, RefreshRun.STATUS_FAILED)
+        self.assertIn("Marked stale", stale.error)
 
 
 class AISuggestionServiceTests(TestCase):

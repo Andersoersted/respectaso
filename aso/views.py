@@ -2,10 +2,13 @@ import csv
 import json
 import logging
 import re
+import threading
 import time
 import urllib.request
+from datetime import timedelta
 
 from django.conf import settings
+from django.db import close_old_connections
 from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
 from django.shortcuts import get_object_or_404, redirect, render
@@ -48,8 +51,32 @@ from .services import (
     ITunesSearchService,
     PopularityEstimator,
 )
+from .refresh_service import run_refresh
 
 logger = logging.getLogger(__name__)
+BULK_REFRESH_STALE_HOURS = 4
+
+
+def _run_bulk_refresh_in_background(*, run_id: int, pairs: list[tuple[int, str]]) -> None:
+    close_old_connections()
+    try:
+        run_refresh(
+            trigger=RefreshRun.TRIGGER_MANUAL,
+            source=SearchResult.SOURCE_BULK_REFRESH,
+            force=True,
+            pairs_override=pairs,
+            run_id=run_id,
+        )
+    except Exception as exc:  # pragma: no cover - defensive production path
+        logger.exception("Background bulk refresh failed for run %s", run_id)
+        RefreshRun.objects.filter(pk=run_id).update(
+            status=RefreshRun.STATUS_FAILED,
+            finished_at=timezone.now(),
+            current_keyword="",
+            error=str(exc),
+        )
+    finally:
+        close_old_connections()
 
 
 # app_rank is now persisted directly on SearchResult during search/refresh.
@@ -259,15 +286,21 @@ def dashboard_view(request):
             result.difficulty_delta = None
             result.rank_delta = None
 
-    # Show rank column when filtering by an app that has a track_id
+    # Show rank column whenever rank can be meaningful in current scope.
     show_rank = False
     selected_app_name = None
+    has_rank_data = any(result.app_rank is not None for result in sorted_results)
+    has_trackable_rows = any(
+        bool(result.keyword.app and result.keyword.app.track_id)
+        for result in sorted_results
+    )
     if app_id:
         selected_app_obj = App.objects.filter(id=app_id).first()
         if selected_app_obj:
             selected_app_name = selected_app_obj.name
-            if selected_app_obj.track_id:
-                show_rank = True
+            show_rank = bool(selected_app_obj.track_id or has_rank_data)
+    else:
+        show_rank = bool(has_trackable_rows or has_rank_data)
 
     base_params = request.GET.copy()
     if "page" in base_params:
@@ -908,76 +941,91 @@ def export_history_csv_view(request):
 @require_POST
 def keywords_bulk_refresh_view(request):
     """
-    Re-run difficulty for all keywords under an app.
+    Start an async refresh for in-scope tracked keyword-country pairs.
 
-    POST body: {"app_id": int|null, "country": "us"}
-    Returns JSON with all new results.
+    POST body: {"app_id": int|null}
+    Returns quickly with run metadata while work continues in a background thread.
     """
-    body = json.loads(request.body)
+    try:
+        body = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"success": False, "error": "Invalid JSON body."}, status=400)
+
     app_id = body.get("app_id")
-    country = body.get("country", "us")
-
-    if app_id:
-        keywords = Keyword.objects.filter(app_id=app_id)
+    if app_id in {"", None}:
+        app_id = None
     else:
-        keywords = Keyword.objects.filter(app__isnull=True)
+        try:
+            app_id = int(app_id)
+        except (TypeError, ValueError):
+            return JsonResponse({"success": False, "error": "Invalid app_id."}, status=400)
 
-    if not keywords.exists():
-        return JsonResponse({"success": True, "results": [], "refreshed": 0})
-
-    itunes_service = ITunesSearchService()
-    difficulty_calc = DifficultyCalculator()
-    popularity_est = PopularityEstimator()
-    download_est = DownloadEstimator()
-
-    results = []
-    for i, kw in enumerate(keywords):
-        if i > 0:
-            time.sleep(2)
-
-        competitors = itunes_service.search_apps(kw.keyword, country=country, limit=25)
-        difficulty_score, breakdown = difficulty_calc.calculate(
-            competitors, keyword=kw.keyword
-        )
-
-        app_rank = None
-        if kw.app and kw.app.track_id:
-            app_rank = itunes_service.find_app_rank(
-                kw.keyword, kw.app.track_id, country=country
+    now = timezone.now()
+    stale_cutoff = now - timedelta(hours=BULK_REFRESH_STALE_HOURS)
+    latest_run = RefreshRun.objects.order_by("-started_at").first()
+    if latest_run and latest_run.status == RefreshRun.STATUS_RUNNING:
+        if latest_run.started_at and latest_run.started_at < stale_cutoff:
+            latest_run.status = RefreshRun.STATUS_FAILED
+            latest_run.finished_at = now
+            latest_run.current_keyword = ""
+            latest_run.error = (
+                f"Marked stale after {BULK_REFRESH_STALE_HOURS}h without finishing; "
+                "a new refresh was started."
+            )
+            latest_run.save(
+                update_fields=["status", "finished_at", "current_keyword", "error"]
+            )
+        else:
+            return JsonResponse(
+                {"success": False, "error": "A refresh is already running."},
+                status=409,
             )
 
-        popularity = popularity_est.estimate(competitors, kw.keyword)
+    keywords_qs = Keyword.objects.all()
+    if app_id is not None:
+        keywords_qs = keywords_qs.filter(app_id=app_id)
+    keyword_ids = list(keywords_qs.values_list("id", flat=True))
+    if not keyword_ids:
+        return JsonResponse({"success": True, "started": False, "total_pairs": 0})
 
-        # Download estimates
-        download_estimates = download_est.estimate(popularity or 0, len(competitors))
-        breakdown["download_estimates"] = download_estimates
+    pairs = list(
+        SearchResult.objects.filter(keyword_id__in=keyword_ids)
+        .values_list("keyword_id", "country")
+        .distinct()
+        .order_by("keyword_id", "country")
+    )
+    seen_keyword_ids = {keyword_id for keyword_id, _ in pairs}
+    pairs.extend((keyword_id, "us") for keyword_id in keyword_ids if keyword_id not in seen_keyword_ids)
+    pairs = sorted((int(keyword_id), str(country or "us").lower()) for keyword_id, country in pairs)
 
-        search_result = SearchResult.create_snapshot(
-            keyword=kw,
-            popularity_score=popularity,
-            difficulty_score=difficulty_score,
-            difficulty_breakdown=breakdown,
-            competitors_data=competitors,
-            app_rank=app_rank,
-            country=country,
-            source=SearchResult.SOURCE_BULK_REFRESH,
-        )
+    if not pairs:
+        return JsonResponse({"success": True, "started": False, "total_pairs": 0})
 
-        results.append({
-            "keyword": kw.keyword,
-            "keyword_id": kw.pk,
-            "result_id": search_result.pk,
-            "popularity_score": popularity,
-            "difficulty_score": difficulty_score,
-            "difficulty_label": search_result.difficulty_label,
-            "difficulty_color": search_result.difficulty_color,
-            "country": country,
-            "searched_at": search_result.searched_at.strftime("%b %d, %H:%M"),
-            "app_rank": app_rank,
-            "app_name": kw.app.name if kw.app else None,
-        })
+    run = RefreshRun.objects.create(
+        trigger=RefreshRun.TRIGGER_MANUAL,
+        status=RefreshRun.STATUS_RUNNING,
+        total=len(pairs),
+        completed=0,
+        current_keyword="",
+        error="",
+    )
 
-    return JsonResponse({"success": True, "results": results, "refreshed": len(results)})
+    thread = threading.Thread(
+        target=_run_bulk_refresh_in_background,
+        kwargs={"run_id": run.id, "pairs": pairs},
+        daemon=True,
+        name=f"aso-bulk-refresh-{run.id}",
+    )
+    thread.start()
+
+    return JsonResponse(
+        {
+            "success": True,
+            "started": True,
+            "run_id": run.id,
+            "total_pairs": len(pairs),
+        }
+    )
 
 
 def _serialize_ai_suggestion(s: AISuggestion):
