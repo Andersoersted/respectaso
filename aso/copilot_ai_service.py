@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import json
 import logging
 import re
+import time
 from typing import Any
 
 from django.conf import settings
@@ -136,15 +137,35 @@ def _extract_responses_parse(output: Any) -> CopilotOutput | None:
     return None
 
 
+def _format_openai_exception(exc: Exception) -> str:
+    msg = str(exc or "").strip() or exc.__class__.__name__
+    if "timed out" in msg.lower():
+        return (
+            "OpenAI request timed out. Retry, or increase OPENAI timeout in Config "
+            "(OPENAI_TIMEOUT_SECONDS)."
+        )
+    return msg
+
+
 def _generate_with_openai(
     *,
     snapshot: dict[str, Any],
     settings_obj: CopilotSettings,
+    run_id: int | None = None,
 ) -> CopilotOutput:
     client = _build_openai_client(settings_obj.api_key)
     user_prompt = _render_prompt(settings_obj.user_prompt_template, snapshot)
     model = settings_obj.model
 
+    logger.warning(
+        "Copilot run %s starting responses.parse model=%s timeout=%ss retries=%s snapshot_rows=%s",
+        run_id or "-",
+        model,
+        settings.OPENAI_TIMEOUT_SECONDS,
+        settings.OPENAI_MAX_RETRIES,
+        len(snapshot.get("feature_rows") or []),
+    )
+    responses_started = time.perf_counter()
     try:
         response = client.responses.parse(
             model=model,
@@ -156,11 +177,33 @@ def _generate_with_openai(
         )
         parsed = _extract_responses_parse(response)
         if parsed is not None:
+            logger.warning(
+                "Copilot run %s responses.parse succeeded in %.2fs",
+                run_id or "-",
+                time.perf_counter() - responses_started,
+            )
             return parsed
+        logger.warning(
+            "Copilot run %s responses.parse returned no parsed payload in %.2fs; trying chat.completions.parse",
+            run_id or "-",
+            time.perf_counter() - responses_started,
+        )
     except Exception as exc:
-        logger.warning("responses.parse failed for model %s: %s", model, exc)
+        logger.warning(
+            "Copilot run %s responses.parse failed for model %s in %.2fs: %s",
+            run_id or "-",
+            model,
+            time.perf_counter() - responses_started,
+            exc,
+        )
 
     # Fallback for models/routes without responses structured parsing.
+    logger.warning(
+        "Copilot run %s starting chat.completions.parse fallback model=%s",
+        run_id or "-",
+        model,
+    )
+    fallback_started = time.perf_counter()
     try:
         completion = client.chat.completions.parse(
             model=model,
@@ -171,13 +214,25 @@ def _generate_with_openai(
             response_format=CopilotOutput,
         )
     except Exception as exc:  # pragma: no cover - runtime fallback path
-        raise AICopilotError(f"Copilot generation failed: {exc}") from exc
+        logger.error(
+            "Copilot run %s chat.completions.parse failed for model %s in %.2fs: %s",
+            run_id or "-",
+            model,
+            time.perf_counter() - fallback_started,
+            exc,
+        )
+        raise AICopilotError(f"Copilot generation failed: {_format_openai_exception(exc)}") from exc
 
     message = completion.choices[0].message if completion.choices else None
     parsed = getattr(message, "parsed", None) if message else None
     if not isinstance(parsed, CopilotOutput):
         refusal = getattr(message, "refusal", "") if message else ""
         raise AICopilotError(refusal or "Copilot model returned no structured output.")
+    logger.warning(
+        "Copilot run %s chat.completions.parse fallback succeeded in %.2fs",
+        run_id or "-",
+        time.perf_counter() - fallback_started,
+    )
     return parsed
 
 
@@ -292,7 +347,7 @@ def generate_ai_copilot(
             stage="generating_recommendations",
             detail="Requesting structured recommendations from the model.",
         )
-        output = _generate_with_openai(snapshot=snapshot, settings_obj=settings_obj)
+        output = _generate_with_openai(snapshot=snapshot, settings_obj=settings_obj, run_id=run.id)
 
         _set_run_progress(
             run,

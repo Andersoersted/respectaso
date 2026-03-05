@@ -218,6 +218,24 @@ document.addEventListener('DOMContentLoaded', () => {
         return `${Math.round((Number(value || 0)) * 100)}%`;
     }
 
+    function normalizeResponseSnippet(rawText) {
+        return String(rawText || '').replace(/\s+/g, ' ').trim().slice(0, 220);
+    }
+
+    async function readJsonResponse(resp, contextLabel) {
+        const rawText = await resp.text();
+        if (!rawText) return {};
+        try {
+            return JSON.parse(rawText);
+        } catch (_err) {
+            const snippet = normalizeResponseSnippet(rawText);
+            const statusPart = `HTTP ${resp.status}${resp.statusText ? ` ${resp.statusText}` : ''}`;
+            throw new Error(
+                `${contextLabel} returned non-JSON response (${statusPart}). ${snippet || 'No details available.'}`
+            );
+        }
+    }
+
     function setStatus(message, type = 'info') {
         statusEl.classList.remove('hidden');
         statusEl.className = 'bg-slate-800/50 border border-white/10 rounded-xl p-3 text-sm';
@@ -259,7 +277,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const params = new URLSearchParams({app_id: String(appId)});
             if (progressPollRunId) params.set('run_id', String(progressPollRunId));
             const resp = await fetch(`{% url "aso:ai_copilot_status" %}?${params.toString()}`);
-            const data = await resp.json();
+            const data = await readJsonResponse(resp, 'Copilot status');
             if (!resp.ok) return;
             const run = data.run || null;
             if (!run) return;
@@ -444,7 +462,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         try {
             const resp = await fetch(`{% url "aso:ai_copilot_list" %}?app_id=${encodeURIComponent(appId)}`);
-            const data = await resp.json();
+            const data = await readJsonResponse(resp, 'Copilot list');
             if (!resp.ok) throw new Error(data.error || 'Failed to load copilot data.');
             renderRecommendations(data.recommendations || []);
             renderMetadataVariants(data.metadata_variants || []);
@@ -474,7 +492,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     sync_asc: false,
                 }),
             });
-            const data = await resp.json();
+            const data = await readJsonResponse(resp, 'Copilot run');
             if (!resp.ok) throw new Error(data.error || 'Copilot generation failed.');
             renderRecommendations(data.recommendations || []);
             renderMetadataVariants(data.metadata_variants || []);
@@ -510,7 +528,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf},
                 body: JSON.stringify({app_id: Number(appId)}),
             });
-            const data = await resp.json();
+            const data = await readJsonResponse(resp, 'ASC sync');
             if (!resp.ok) throw new Error(data.error || 'ASC sync failed.');
             renderASCStatus(data.status || null);
             setStatus(`ASC sync completed (${data.rows_upserted || 0} row(s)).`, 'success');
@@ -538,7 +556,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 method: 'POST',
                 headers: {'X-CSRFToken': csrf},
             });
-            const data = await resp.json();
+            const data = await readJsonResponse(resp, `${kind} ${action}`);
             if (!resp.ok) throw new Error(data.error || 'Action failed.');
             setStatus(`${kind} updated: ${action}.`, 'success');
             await loadCopilotData();

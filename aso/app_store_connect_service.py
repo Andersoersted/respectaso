@@ -183,12 +183,16 @@ class AppStoreConnectService:
         response = self._request("GET", f"/v1/analyticsReportRequests/{request_id}/reports")
         return list((response or {}).get("data") or [])
 
-    def list_report_segments(self, report_id: str) -> list[dict[str, Any]]:
-        response = self._request("GET", f"/v1/analytics/reports/{report_id}/segments")
+    def list_report_instances(self, report_id: str) -> list[dict[str, Any]]:
+        response = self._request("GET", f"/v1/analyticsReports/{report_id}/instances")
+        return list((response or {}).get("data") or [])
+
+    def list_report_segments(self, instance_id: str) -> list[dict[str, Any]]:
+        response = self._request("GET", f"/v1/analyticsReportInstances/{instance_id}/segments")
         return list((response or {}).get("data") or [])
 
     def get_report_segment(self, segment_id: str) -> dict[str, Any]:
-        response = self._request("GET", f"/v1/analytics/reportSegments/{segment_id}")
+        response = self._request("GET", f"/v1/analyticsReportSegments/{segment_id}")
         return (response or {}).get("data") or {}
 
     def download_segment_payload(self, url: str) -> dict[str, Any]:
@@ -316,31 +320,50 @@ class AppStoreConnectService:
             report_id = str(report.get("id") or "").strip()
             if not report_id:
                 continue
-            segments = self.list_report_segments(report_id)
-            if not segments:
-                report_url = ((report.get("attributes") or {}).get("downloadURL") or "").strip()
-                if report_url:
-                    payload = self.download_segment_payload(report_url)
-                    all_rows.extend(self.parse_metric_rows(payload))
+            instances = self.list_report_instances(report_id)
+            if not instances:
+                logger.debug("ASC report %s has no instances.", report_id)
                 continue
 
-            for segment in segments:
-                segment_id = str(segment.get("id") or "").strip()
-                if not segment_id:
+            for instance in instances:
+                instance_id = str(instance.get("id") or "").strip()
+                if not instance_id:
                     continue
-                segment_data = self.get_report_segment(segment_id)
-                attrs = (segment_data.get("attributes") or {}) if isinstance(segment_data, dict) else {}
-                segment_url = (
-                    attrs.get("reportSegmentURL")
-                    or attrs.get("url")
-                    or attrs.get("downloadURL")
-                    or ""
-                )
-                segment_url = str(segment_url).strip()
-                if not segment_url:
+                segments = self.list_report_segments(instance_id)
+                if not segments:
+                    logger.debug("ASC report instance %s has no segments.", instance_id)
                     continue
-                payload = self.download_segment_payload(segment_url)
-                all_rows.extend(self.parse_metric_rows(payload))
+
+                for segment in segments:
+                    attrs = (segment.get("attributes") or {}) if isinstance(segment, dict) else {}
+                    segment_url = (
+                        attrs.get("url")
+                        or attrs.get("reportSegmentURL")
+                        or attrs.get("downloadURL")
+                        or ""
+                    )
+                    segment_url = str(segment_url).strip()
+                    if not segment_url:
+                        segment_id = str(segment.get("id") or "").strip()
+                        if not segment_id:
+                            continue
+                        segment_data = self.get_report_segment(segment_id)
+                        segment_attrs = (
+                            (segment_data.get("attributes") or {})
+                            if isinstance(segment_data, dict)
+                            else {}
+                        )
+                        segment_url = (
+                            segment_attrs.get("url")
+                            or segment_attrs.get("reportSegmentURL")
+                            or segment_attrs.get("downloadURL")
+                            or ""
+                        )
+                        segment_url = str(segment_url).strip()
+                    if not segment_url:
+                        continue
+                    payload = self.download_segment_payload(segment_url)
+                    all_rows.extend(self.parse_metric_rows(payload))
         return all_rows
 
     def upsert_metric_rows(self, app: App, rows: list[dict[str, Any]], *, days_back: int) -> int:
