@@ -34,6 +34,11 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 WORD_RE = re.compile(r"[a-z0-9]+")
+SNAPSHOT_FEATURE_ROWS_LIMIT = 80
+SNAPSHOT_EXISTING_KEYWORDS_LIMIT = 120
+SNAPSHOT_RETRY_FEATURE_ROWS_LIMIT = 30
+SNAPSHOT_RETRY_EXISTING_KEYWORDS_LIMIT = 60
+OPENAI_COPILOT_MAX_OUTPUT_TOKENS = 1200
 
 
 class AICopilotError(Exception):
@@ -145,12 +150,49 @@ def _truncate_chars(text: str, limit: int) -> str:
     return value[:limit].strip()
 
 
+def _is_timeout_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return "timed out" in text or "timeout" in text
+
+
 def _render_prompt(template: str, payload: dict[str, Any]) -> str:
     payload_json = json.dumps(payload, ensure_ascii=True)
     prompt = (template or "").replace("{{SNAPSHOT_JSON}}", payload_json)
     if "{{SNAPSHOT_JSON}}" not in (template or ""):
         prompt += f"\n\nCOPILOT SNAPSHOT JSON:\n{payload_json}"
     return prompt
+
+
+def _compact_feature_rows(rows: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    compact_rows: list[dict[str, Any]] = []
+    for row in (rows or [])[: max(1, int(limit))]:
+        compact_rows.append(
+            {
+                "keyword": row.get("keyword"),
+                "country": row.get("country"),
+                "popularity": row.get("popularity"),
+                "difficulty": row.get("difficulty"),
+                "opportunity": row.get("opportunity"),
+                "app_rank": row.get("app_rank"),
+                "prev_app_rank": row.get("prev_app_rank"),
+                "score_market_opportunity": row.get("score_market_opportunity"),
+                "score_rank_momentum": row.get("score_rank_momentum"),
+                "score_business_impact": row.get("score_business_impact"),
+                "score_coverage_gap": row.get("score_coverage_gap"),
+            }
+        )
+    return compact_rows
+
+
+def _compact_snapshot(snapshot: dict[str, Any], *, feature_rows_limit: int, existing_keywords_limit: int) -> dict[str, Any]:
+    compact = dict(snapshot or {})
+    compact["feature_rows"] = _compact_feature_rows(snapshot.get("feature_rows") or [], limit=feature_rows_limit)
+    compact["existing_keywords"] = list((snapshot.get("existing_keywords") or [])[: max(1, int(existing_keywords_limit))])
+    compact["snapshot_meta"] = {
+        "feature_rows_limit": int(feature_rows_limit),
+        "existing_keywords_limit": int(existing_keywords_limit),
+    }
+    return compact
 
 
 def _extract_responses_parse(output: Any) -> CopilotOutput | None:
@@ -299,57 +341,72 @@ def _generate_with_openai(
     snapshot: dict[str, Any],
     settings_obj: CopilotSettings,
     run_id: int | None = None,
+    attempt: str = "primary",
+    timeout_seconds: float | None = None,
 ) -> CopilotOutput:
+    effective_timeout = float(timeout_seconds or settings.OPENAI_TIMEOUT_SECONDS)
     client = _build_openai_client(settings_obj.api_key)
     request_client = client.with_options(
-        timeout=settings.OPENAI_TIMEOUT_SECONDS,
-        max_retries=settings.OPENAI_MAX_RETRIES,
+        timeout=effective_timeout,
+        # Keep retries explicit and bounded in app logic to avoid multi-minute cascaded waits.
+        max_retries=0,
     )
     user_prompt = _render_prompt(settings_obj.user_prompt_template, snapshot)
     model = settings_obj.model
+    is_gpt5_family = model.lower().startswith("gpt-5")
+
+    responses_parse_kwargs: dict[str, Any] = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": settings_obj.system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "text_format": CopilotOutput,
+        "max_output_tokens": OPENAI_COPILOT_MAX_OUTPUT_TOKENS,
+    }
+    if is_gpt5_family:
+        # Lower reasoning effort reduces latency for large prompts.
+        responses_parse_kwargs["reasoning"] = {"effort": "none"}
 
     logger.warning(
-        "Copilot run %s sending payload to OpenAI responses.parse model=%s timeout=%ss retries=%s snapshot_rows=%s existing_keywords=%s prompt_chars=%s",
+        "Copilot run %s sending payload to OpenAI responses.parse attempt=%s model=%s timeout=%ss retries=%s snapshot_rows=%s existing_keywords=%s prompt_chars=%s",
         run_id or "-",
+        attempt,
         model,
-        settings.OPENAI_TIMEOUT_SECONDS,
-        settings.OPENAI_MAX_RETRIES,
+        effective_timeout,
+        0,
         len(snapshot.get("feature_rows") or []),
         len(snapshot.get("existing_keywords") or []),
         len(user_prompt),
     )
     responses_started = time.perf_counter()
     try:
-        response = request_client.responses.parse(
-            model=model,
-            input=[
-                {"role": "system", "content": settings_obj.system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            text_format=CopilotOutput,
-        )
+        response = request_client.responses.parse(**responses_parse_kwargs)
         parsed = _extract_responses_parse(response)
         if parsed is not None:
             req_id = getattr(response, "_request_id", None)
             logger.warning(
-                "Copilot run %s responses.parse succeeded in %.2fs request_id=%s",
+                "Copilot run %s responses.parse succeeded in %.2fs attempt=%s request_id=%s",
                 run_id or "-",
                 time.perf_counter() - responses_started,
+                attempt,
                 req_id or "-",
             )
             return parsed
         logger.warning(
-            "Copilot run %s responses.parse returned no parsed payload in %.2fs; trying chat.completions.parse",
+            "Copilot run %s responses.parse returned no parsed payload in %.2fs attempt=%s; trying chat.completions.parse",
             run_id or "-",
             time.perf_counter() - responses_started,
+            attempt,
         )
     except Exception as exc:
         meta = _openai_error_meta(exc)
         logger.warning(
-            "Copilot run %s responses.parse failed for model %s in %.2fs type=%s status=%s request_id=%s detail=%s body=%s",
+            "Copilot run %s responses.parse failed for model %s in %.2fs attempt=%s type=%s status=%s request_id=%s detail=%s body=%s",
             run_id or "-",
             model,
             time.perf_counter() - responses_started,
+            attempt,
             meta.get("exception_type"),
             meta.get("status_code"),
             meta.get("request_id") or "-",
@@ -362,27 +419,31 @@ def _generate_with_openai(
 
     # Fallback for models/routes without responses structured parsing.
     logger.warning(
-        "Copilot run %s starting chat.completions.parse fallback model=%s",
+        "Copilot run %s starting chat.completions.parse fallback attempt=%s model=%s",
         run_id or "-",
+        attempt,
         model,
     )
     fallback_started = time.perf_counter()
+    chat_parse_kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": settings_obj.system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "response_format": CopilotOutput,
+    }
+
     try:
-        completion = request_client.chat.completions.parse(
-            model=model,
-            messages=[
-                {"role": "system", "content": settings_obj.system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format=CopilotOutput,
-        )
+        completion = request_client.chat.completions.parse(**chat_parse_kwargs)
     except Exception as exc:  # pragma: no cover - runtime fallback path
         meta = _openai_error_meta(exc)
         logger.error(
-            "Copilot run %s chat.completions.parse failed for model %s in %.2fs type=%s status=%s request_id=%s detail=%s body=%s",
+            "Copilot run %s chat.completions.parse failed for model %s in %.2fs attempt=%s type=%s status=%s request_id=%s detail=%s body=%s",
             run_id or "-",
             model,
             time.perf_counter() - fallback_started,
+            attempt,
             meta.get("exception_type"),
             meta.get("status_code"),
             meta.get("request_id") or "-",
@@ -399,9 +460,10 @@ def _generate_with_openai(
         raise AICopilotError(refusal or "Copilot model returned no structured output.", user_error=True)
     req_id = getattr(completion, "_request_id", None)
     logger.warning(
-        "Copilot run %s chat.completions.parse fallback succeeded in %.2fs request_id=%s",
+        "Copilot run %s chat.completions.parse fallback succeeded in %.2fs attempt=%s request_id=%s",
         run_id or "-",
         time.perf_counter() - fallback_started,
+        attempt,
         req_id or "-",
     )
     return parsed
@@ -422,7 +484,9 @@ def _normalize_action(value: str, score_overall: float) -> str:
 
 def _build_snapshot(app: App, country: str, feature_rows: list[dict[str, Any]], summary: dict[str, Any]) -> dict[str, Any]:
     existing_keywords = list(
-        Keyword.objects.filter(app=app).values_list("keyword", flat=True).order_by("-created_at")[:300]
+        Keyword.objects.filter(app=app).values_list("keyword", flat=True).order_by("-created_at")[
+            :SNAPSHOT_EXISTING_KEYWORDS_LIMIT
+        ]
     )
     return {
         "app": {
@@ -436,7 +500,7 @@ def _build_snapshot(app: App, country: str, feature_rows: list[dict[str, Any]], 
         "country": country,
         "existing_keywords": existing_keywords,
         "feature_summary": summary,
-        "feature_rows": feature_rows[:120],
+        "feature_rows": _compact_feature_rows(feature_rows, limit=SNAPSHOT_FEATURE_ROWS_LIMIT),
         "rules": {
             "title_max_chars": 30,
             "subtitle_max_chars": 30,
@@ -538,7 +602,46 @@ def generate_ai_copilot(
                 f"{len(snapshot.get('existing_keywords') or [])} existing keyword(s))."
             ),
         )
-        output = _generate_with_openai(snapshot=snapshot, settings_obj=settings_obj, run_id=run.id)
+        try:
+            output = _generate_with_openai(
+                snapshot=snapshot,
+                settings_obj=settings_obj,
+                run_id=run.id,
+                attempt="primary",
+                timeout_seconds=settings.OPENAI_TIMEOUT_SECONDS,
+            )
+        except AICopilotError as exc:
+            if _is_timeout_error(exc):
+                compact_snapshot = _compact_snapshot(
+                    snapshot,
+                    feature_rows_limit=SNAPSHOT_RETRY_FEATURE_ROWS_LIMIT,
+                    existing_keywords_limit=SNAPSHOT_RETRY_EXISTING_KEYWORDS_LIMIT,
+                )
+                if (
+                    len(compact_snapshot.get("feature_rows") or []) < len(snapshot.get("feature_rows") or [])
+                    or len(compact_snapshot.get("existing_keywords") or []) < len(snapshot.get("existing_keywords") or [])
+                ):
+                    _update_run_fields(run, input_snapshot_json=compact_snapshot)
+                    _set_run_progress(
+                        run,
+                        percent=40,
+                        stage="retrying_compact_prompt",
+                        detail=(
+                            "Primary model request timed out. Retrying once with a smaller "
+                            "snapshot to reduce latency."
+                        ),
+                    )
+                    output = _generate_with_openai(
+                        snapshot=compact_snapshot,
+                        settings_obj=settings_obj,
+                        run_id=run.id,
+                        attempt="compact_retry",
+                        timeout_seconds=max(float(settings.OPENAI_TIMEOUT_SECONDS), 60.0),
+                    )
+                else:
+                    raise
+            else:
+                raise
 
         logger.warning(
             "Copilot run %s received model output recommendations=%s metadata_variants=%s",

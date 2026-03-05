@@ -10,6 +10,14 @@ from django.urls import reverse
 from django.utils import timezone
 
 from aso.ai_service import AISuggestionError, accept_ai_suggestion, generate_ai_suggestions
+from aso.copilot_ai_service import (
+    AICopilotError,
+    CopilotOutput,
+    CopilotSettings,
+    MetadataVariantOut,
+    RecommendationOut,
+    generate_ai_copilot,
+)
 from aso.models import (
     ASCMetricDaily,
     ASCSyncRun,
@@ -901,3 +909,69 @@ class AICopilotEndpointTests(TestCase):
         self.assertEqual(reject_resp.status_code, 200)
         draft.refresh_from_db()
         self.assertEqual(draft.status, AICopilotMetadataVariant.STATUS_REJECTED)
+
+
+class AICopilotServiceTimeoutRetryTests(TestCase):
+    @patch("aso.copilot_ai_service._generate_with_openai")
+    def test_generate_ai_copilot_retries_with_compact_snapshot_after_timeout(self, mock_generate):
+        app = App.objects.create(name="Retry App", track_id=121212, asc_app_id="121212")
+        for i in range(35):
+            kw = Keyword.objects.create(keyword=f"retry keyword {i}", app=app)
+            SearchResult.create_snapshot(
+                keyword=kw,
+                country="us",
+                source=SearchResult.SOURCE_MANUAL_SEARCH,
+                popularity_score=max(1, 62 - i),
+                difficulty_score=min(99, 30 + i),
+                difficulty_breakdown={},
+                competitors_data=[],
+                app_rank=12 + i,
+            )
+        output = CopilotOutput(
+            recommendations=[
+                RecommendationOut(
+                    keyword="retry keyword plus",
+                    action="add",
+                    rationale="Timed-out primary request recovered with compact retry.",
+                    llm_confidence=0.77,
+                )
+            ],
+            metadata_variants=[
+                MetadataVariantOut(
+                    title="Retry Title",
+                    subtitle="Retry subtitle",
+                    keyword_field="retry,keyword",
+                    covered_keywords=["retry keyword plus"],
+                    predicted_impact=0.58,
+                    rationale="Fallback output",
+                )
+            ],
+        )
+        mock_generate.side_effect = [
+            AICopilotError(
+                "Copilot generation failed: OpenAI request timed out. Retry, or increase OPENAI timeout in Config (OPENAI_TIMEOUT_SECONDS).",
+                user_error=False,
+            ),
+            output,
+        ]
+
+        run = generate_ai_copilot(
+            app,
+            country="us",
+            settings_obj=CopilotSettings(
+                model="gpt-5-mini",
+                api_key="sk-test-123",
+                system_prompt="System prompt",
+                user_prompt_template="{{SNAPSHOT_JSON}}",
+            ),
+        )
+
+        self.assertEqual(run.status, AICopilotRun.STATUS_SUCCESS)
+        self.assertEqual(mock_generate.call_count, 2)
+        first_snapshot = mock_generate.call_args_list[0].kwargs["snapshot"]
+        second_snapshot = mock_generate.call_args_list[1].kwargs["snapshot"]
+        self.assertGreaterEqual(len(first_snapshot.get("feature_rows") or []), len(second_snapshot.get("feature_rows") or []))
+        self.assertGreaterEqual(
+            len(first_snapshot.get("existing_keywords") or []),
+            len(second_snapshot.get("existing_keywords") or []),
+        )
