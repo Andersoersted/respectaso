@@ -1007,7 +1007,7 @@ class AICopilotOpenAIRequestTests(TestCase):
             def __init__(self):
                 self.kwargs = None
 
-            def parse(self, **kwargs):
+            def create(self, **kwargs):
                 self.kwargs = kwargs
                 return SimpleNamespace(output_parsed=CopilotOutput())
 
@@ -1046,7 +1046,7 @@ class AICopilotOpenAIRequestTests(TestCase):
             def __init__(self):
                 self.kwargs = None
 
-            def parse(self, **kwargs):
+            def create(self, **kwargs):
                 self.kwargs = kwargs
                 return SimpleNamespace(output_parsed=CopilotOutput())
 
@@ -1107,7 +1107,7 @@ class AICopilotOpenAIRequestTests(TestCase):
             def __init__(self):
                 self.kwargs = None
 
-            def parse(self, **kwargs):
+            def create(self, **kwargs):
                 self.kwargs = kwargs
                 return SimpleNamespace(
                     output_parsed=None,

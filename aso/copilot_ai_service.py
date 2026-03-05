@@ -53,7 +53,7 @@ class AICopilotError(Exception):
 class RecommendationOut(BaseModel):
     keyword: str = Field(min_length=2, max_length=80)
     action: str = Field(default="watch")
-    rationale: str = Field(default="", max_length=240)
+    rationale: str = Field(default="", max_length=160)
     llm_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
@@ -63,12 +63,12 @@ class MetadataVariantOut(BaseModel):
     keyword_field: str = Field(default="", max_length=180)
     covered_keywords: list[str] = Field(default_factory=list)
     predicted_impact: float = Field(default=0.5, ge=0.0, le=1.0)
-    rationale: str = Field(default="", max_length=280)
+    rationale: str = Field(default="", max_length=180)
 
 
 class CopilotOutput(BaseModel):
-    recommendations: list[RecommendationOut] = Field(default_factory=list, max_length=30)
-    metadata_variants: list[MetadataVariantOut] = Field(default_factory=list, max_length=6)
+    recommendations: list[RecommendationOut] = Field(default_factory=list, max_length=12)
+    metadata_variants: list[MetadataVariantOut] = Field(default_factory=list, max_length=3)
 
 
 @dataclass(slots=True)
@@ -191,6 +191,7 @@ def _is_recoverable_generation_error(exc: Exception) -> bool:
         "json_invalid",
         "eof while parsing",
         "lengthfinishreasonerror",
+        "incomplete structured json",
         "incomplete response",
         "max_output_tokens",
         "no structured payload",
@@ -200,9 +201,17 @@ def _is_recoverable_generation_error(exc: Exception) -> bool:
 
 def _render_prompt(template: str, payload: dict[str, Any]) -> str:
     payload_json = json.dumps(payload, ensure_ascii=True)
-    prompt = (template or "").replace("{{SNAPSHOT_JSON}}", payload_json)
+    prompt = (template or "").replace("{{SNAPSHOT_JSON}}", payload_json).replace("{{ONLINE_CONTEXT_JSON}}", "{}")
     if "{{SNAPSHOT_JSON}}" not in (template or ""):
         prompt += f"\n\nCOPILOT SNAPSHOT JSON:\n{payload_json}"
+    prompt += (
+        "\n\nSTRUCTURED OUTPUT REQUIREMENTS:\n"
+        "- Return JSON only.\n"
+        "- recommendations: max 12 items.\n"
+        "- metadata_variants: max 3 items.\n"
+        "- Keep rationale fields concise (<=120 characters).\n"
+        "- Do not include extra top-level keys."
+    )
     return prompt
 
 
@@ -478,6 +487,8 @@ def _coerce_copilot_output_from_response(
             "OpenAI returned an incomplete response "
             f"(reason={incomplete_reason or 'unknown'})."
         )
+        if incomplete_reason == "max_output_tokens":
+            detail += " The model hit max_output_tokens before completing valid JSON."
         logger.warning(
             "Copilot run %s %s returned incomplete response in %.2fs reason=%s parse_errors=%s preview=%s",
             run_id or "-",
@@ -607,7 +618,7 @@ def _format_openai_exception(exc: Exception) -> tuple[str, bool]:
 
 
 def _should_fallback_after_responses_error(exc: Exception, *, meta: dict[str, Any]) -> bool:
-    """Only fallback when responses.parse appears unsupported for this route/model."""
+    """Only fallback when structured responses.create formatting appears unsupported for this route/model."""
     status_code = meta.get("status_code")
     text = f"{exc} {meta.get('body_excerpt') or ''}".lower()
 
@@ -629,7 +640,10 @@ def _should_fallback_after_responses_error(exc: Exception, *, meta: dict[str, An
 
     parse_unsupported_markers = (
         "text_format",
+        "text.format",
         "response_format",
+        "response.format",
+        "json_schema",
         "path_error",
         "not a valid url",
         "unsupported",
@@ -659,6 +673,28 @@ def _generate_with_openai(
     user_prompt = _render_prompt(settings_obj.user_prompt_template, snapshot)
     model = settings_obj.model
     reasoning_effort = _default_reasoning_effort_for_model(model, settings_obj.reasoning_effort)
+    if (
+        model.lower().startswith("gpt-5")
+        and reasoning_effort in {"medium", "high", "xhigh"}
+        and len(user_prompt) >= 7000
+    ):
+        original_reasoning = reasoning_effort
+        reasoning_effort = "low"
+        logger.warning(
+            "Copilot run %s lowering reasoning effort from %s to %s for large prompt (%s chars)",
+            effective_run_id or "-",
+            original_reasoning,
+            reasoning_effort,
+            len(user_prompt),
+        )
+        _append_run_event(
+            run,
+            stage="generating_recommendations",
+            message=(
+                f"Large prompt detected ({len(user_prompt)} chars). "
+                f"Lowering reasoning from {original_reasoning} to {reasoning_effort} to reduce truncation risk."
+            ),
+        )
     if attempt != "primary":
         reasoning_effort = _fallback_reasoning_for_retry(reasoning_effort)
 
@@ -695,20 +731,27 @@ def _generate_with_openai(
     }
     payload_summary_json = json.dumps(payload_summary, ensure_ascii=True)
 
-    responses_parse_kwargs: dict[str, Any] = {
+    responses_create_kwargs: dict[str, Any] = {
         "model": model,
         "input": [
             {"role": "system", "content": settings_obj.system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "text_format": CopilotOutput,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "copilot_output",
+                "strict": True,
+                "schema": CopilotOutput.model_json_schema(),
+            }
+        },
         "max_output_tokens": OPENAI_COPILOT_MAX_OUTPUT_TOKENS,
     }
     if reasoning_effort:
-        responses_parse_kwargs["reasoning"] = {"effort": reasoning_effort}
+        responses_create_kwargs["reasoning"] = {"effort": reasoning_effort}
 
     logger.warning(
-        "Copilot run %s sending payload to OpenAI responses.parse summary=%s",
+        "Copilot run %s sending payload to OpenAI responses.create summary=%s",
         effective_run_id or "-",
         payload_summary_json,
     )
@@ -718,7 +761,7 @@ def _generate_with_openai(
         message=f"OpenAI request summary: {payload_summary_json}",
     )
     logger.warning(
-        "Copilot run %s sending payload to OpenAI responses.parse attempt=%s model=%s reasoning=%s timeout=%ss retries=%s snapshot_rows=%s existing_keywords=%s prompt_chars=%s",
+        "Copilot run %s sending payload to OpenAI responses.create attempt=%s model=%s reasoning=%s timeout=%ss retries=%s snapshot_rows=%s existing_keywords=%s prompt_chars=%s",
         effective_run_id or "-",
         attempt,
         model,
@@ -731,10 +774,10 @@ def _generate_with_openai(
     )
     responses_started = time.perf_counter()
     try:
-        response = request_client.responses.parse(**responses_parse_kwargs)
+        response = request_client.responses.create(**responses_create_kwargs)
         return _coerce_copilot_output_from_response(
             response,
-            route="responses.parse",
+            route="responses.create",
             attempt=attempt,
             run=run,
             run_id=effective_run_id,
@@ -745,7 +788,7 @@ def _generate_with_openai(
             raise
         meta = _openai_error_meta(exc)
         logger.warning(
-            "Copilot run %s responses.parse failed for model %s in %.2fs attempt=%s type=%s status=%s request_id=%s detail=%s body=%s",
+            "Copilot run %s responses.create failed for model %s in %.2fs attempt=%s type=%s status=%s request_id=%s detail=%s body=%s",
             effective_run_id or "-",
             model,
             time.perf_counter() - responses_started,
@@ -761,24 +804,24 @@ def _generate_with_openai(
             stage="generating_recommendations",
             kind="error",
             message=(
-                "responses.parse failed "
+                "responses.create failed "
                 f"(type={meta.get('exception_type')}, status={meta.get('status_code')}, "
                 f"request_id={meta.get('request_id') or '-'}): {exc}"
             ),
         )
 
         if _is_unsupported_reasoning_error(exc, meta=meta) and reasoning_effort:
-            fallback_reasoning_effort = "low" if model.lower().startswith("gpt-5") else ""
+            fallback_reasoning_effort = _fallback_reasoning_for_retry(reasoning_effort)
             if fallback_reasoning_effort == reasoning_effort:
                 fallback_reasoning_effort = ""
             if fallback_reasoning_effort != reasoning_effort:
-                retry_parse_kwargs = dict(responses_parse_kwargs)
+                retry_create_kwargs = dict(responses_create_kwargs)
                 if fallback_reasoning_effort:
-                    retry_parse_kwargs["reasoning"] = {"effort": fallback_reasoning_effort}
+                    retry_create_kwargs["reasoning"] = {"effort": fallback_reasoning_effort}
                 else:
-                    retry_parse_kwargs.pop("reasoning", None)
+                    retry_create_kwargs.pop("reasoning", None)
                 logger.warning(
-                    "Copilot run %s retrying responses.parse with fallback reasoning effort=%s (initial=%s)",
+                    "Copilot run %s retrying responses.create with fallback reasoning effort=%s (initial=%s)",
                     effective_run_id or "-",
                     fallback_reasoning_effort or "auto",
                     reasoning_effort,
@@ -793,10 +836,10 @@ def _generate_with_openai(
                 )
                 retry_started = time.perf_counter()
                 try:
-                    retry_response = request_client.responses.parse(**retry_parse_kwargs)
+                    retry_response = request_client.responses.create(**retry_create_kwargs)
                     return _coerce_copilot_output_from_response(
                         retry_response,
-                        route="responses.parse",
+                        route="responses.create",
                         attempt=f"{attempt}:reasoning_retry",
                         run=run,
                         run_id=effective_run_id,
@@ -807,7 +850,7 @@ def _generate_with_openai(
                         raise
                     retry_meta = _openai_error_meta(retry_exc)
                     logger.warning(
-                        "Copilot run %s responses.parse reasoning fallback failed type=%s status=%s request_id=%s detail=%s body=%s",
+                        "Copilot run %s responses.create reasoning fallback failed type=%s status=%s request_id=%s detail=%s body=%s",
                         effective_run_id or "-",
                         retry_meta.get("exception_type"),
                         retry_meta.get("status_code"),
