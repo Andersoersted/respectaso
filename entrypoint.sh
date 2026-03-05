@@ -12,7 +12,24 @@ if [ -z "$SECRET_KEY" ]; then
     fi
 fi
 
-python manage.py migrate --noinput
+if python manage.py migrate --check --noinput >/dev/null 2>&1; then
+    echo "No pending migrations."
+else
+    echo "Applying pending migrations..."
+    max_attempts=5
+    attempt=1
+    until python manage.py migrate --noinput; do
+        if [ "$attempt" -ge "$max_attempts" ]; then
+            echo "Migration failed after ${max_attempts} attempts."
+            exit 1
+        fi
+        sleep_seconds=$((attempt * 2))
+        echo "Migration attempt ${attempt}/${max_attempts} failed. Retrying in ${sleep_seconds}s..."
+        sleep "$sleep_seconds"
+        attempt=$((attempt + 1))
+    done
+fi
+
 python manage.py collectstatic --noinput
 
 echo ""

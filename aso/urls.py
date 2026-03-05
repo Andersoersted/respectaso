@@ -12,6 +12,7 @@ urlpatterns = [
     path("ai/suggestions/<int:suggestion_id>/accept/", views.ai_suggestion_accept_view, name="ai_suggestion_accept"),
     path("ai/suggestions/<int:suggestion_id>/reject/", views.ai_suggestion_reject_view, name="ai_suggestion_reject"),
     path("ai/copilot/list/", views.ai_copilot_list_view, name="ai_copilot_list"),
+    path("ai/copilot/status/", views.ai_copilot_status_view, name="ai_copilot_status"),
     path("ai/copilot/generate/", views.ai_copilot_generate_view, name="ai_copilot_generate"),
     path(
         "ai/copilot/recommendations/<int:recommendation_id>/accept/",

@@ -103,6 +103,8 @@ class AppStoreConnectService:
         url = path_or_url if absolute_url else f"{self.BASE_URL}{path_or_url}"
         attempts = max(1, self.max_retries + 1)
         last_exc: Exception | None = None
+        last_status: int | None = None
+        last_body_excerpt = ""
 
         for attempt in range(1, attempts + 1):
             try:
@@ -114,12 +116,32 @@ class AppStoreConnectService:
                     headers=self._headers(),
                     timeout=self.timeout_seconds,
                 )
+                last_status = response.status_code
+                last_body_excerpt = (response.text or "").strip().replace("\n", " ")[:400]
                 if response.status_code in {401, 403}:
-                    raise ASCAuthError("App Store Connect authentication failed.")
+                    msg = "App Store Connect authentication failed."
+                    if last_body_excerpt:
+                        msg = f"{msg} Details: {last_body_excerpt}"
+                    raise ASCAuthError(msg)
                 if response.status_code >= 500 and attempt < attempts:
+                    logger.warning(
+                        "ASC %s %s failed with %s (attempt %s/%s). Retrying.",
+                        method.upper(),
+                        url,
+                        response.status_code,
+                        attempt,
+                        attempts,
+                    )
                     time.sleep(min(2.0, attempt * 0.5))
                     continue
                 if response.status_code == 429 and attempt < attempts:
+                    logger.warning(
+                        "ASC %s %s was rate-limited (429) (attempt %s/%s). Retrying.",
+                        method.upper(),
+                        url,
+                        attempt,
+                        attempts,
+                    )
                     time.sleep(min(5.0, attempt * 1.0))
                     continue
                 response.raise_for_status()
@@ -136,7 +158,10 @@ class AppStoreConnectService:
             except ValueError as exc:
                 raise ASCAPIError(f"App Store Connect returned non-JSON data for {url}.") from exc
 
-        raise ASCAPIError(f"App Store Connect request failed for {url}: {last_exc}")
+        detail = f"status={last_status}" if last_status is not None else "status=unknown"
+        if last_body_excerpt:
+            detail = f"{detail}, body={last_body_excerpt}"
+        raise ASCAPIError(f"App Store Connect request failed for {url}: {last_exc} ({detail})")
 
     def create_report_request(self, asc_app_id: str) -> str:
         payload = {
@@ -342,8 +367,9 @@ class AppStoreConnectService:
                 touched += 1
         return touched
 
-    def sync_app_metrics(self, app: App, *, days_back: int) -> int:
-        if not app.asc_app_id:
-            raise ASCError("This app is missing `asc_app_id`.")
-        rows = self.fetch_metric_rows(app.asc_app_id)
+    def sync_app_metrics(self, app: App, *, days_back: int, asc_app_id: str | None = None) -> int:
+        resolved_asc_app_id = str(asc_app_id or app.asc_app_id or app.track_id or "").strip()
+        if not resolved_asc_app_id:
+            raise ASCError("This app is missing `asc_app_id` (and has no track_id fallback).")
+        rows = self.fetch_metric_rows(resolved_asc_app_id)
         return self.upsert_metric_rows(app, rows, days_back=days_back)

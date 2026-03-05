@@ -740,6 +740,7 @@ def apps_view(request):
                         name=request.POST.get("name", "Unknown App"),
                         bundle_id=request.POST.get("bundle_id", ""),
                         track_id=track_id_int,
+                        asc_app_id=(request.POST.get("asc_app_id", "") or "").strip() or str(track_id_int),
                         store_url=request.POST.get("store_url", ""),
                         icon_url=request.POST.get("icon_url", ""),
                         seller_name=request.POST.get("seller_name", ""),
@@ -1130,6 +1131,23 @@ def _serialize_copilot_metadata_variant(variant: AICopilotMetadataVariant):
     }
 
 
+def _serialize_copilot_run(run: AICopilotRun | None):
+    if not run:
+        return None
+    return {
+        "id": run.id,
+        "status": run.status,
+        "progress_percent": int(run.progress_percent or 0),
+        "progress_stage": run.progress_stage or "queued",
+        "progress_detail": run.progress_detail or "",
+        "model": run.model,
+        "country": run.country,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+        "error": run.error,
+    }
+
+
 def _serialize_asc_sync_run(run: ASCSyncRun | None):
     if not run:
         return None
@@ -1144,14 +1162,25 @@ def _serialize_asc_sync_run(run: ASCSyncRun | None):
     }
 
 
+def _effective_asc_app_id(app: App) -> str:
+    explicit = str(app.asc_app_id or "").strip()
+    if explicit:
+        return explicit
+    if app.track_id:
+        return str(app.track_id).strip()
+    return ""
+
+
 def _asc_status_for_app(app: App):
     latest_run = ASCSyncRun.objects.filter(app=app).order_by("-started_at").first()
     latest_metric_date = (
         ASCMetricDaily.objects.filter(app=app).order_by("-date").values_list("date", flat=True).first()
     )
+    resolved_asc_app_id = _effective_asc_app_id(app)
     return {
         "app_id": app.id,
-        "asc_app_id": app.asc_app_id,
+        "asc_app_id": resolved_asc_app_id,
+        "asc_app_id_source": "asc_app_id" if str(app.asc_app_id or "").strip() else ("track_id" if app.track_id else "none"),
         "latest_run": _serialize_asc_sync_run(latest_run),
         "metric_rows": ASCMetricDaily.objects.filter(app=app).count(),
         "latest_metric_date": latest_metric_date.isoformat() if latest_metric_date else None,
@@ -1159,11 +1188,7 @@ def _asc_status_for_app(app: App):
 
 
 def _copilot_payload_for_app(app: App):
-    runs = list(
-        AICopilotRun.objects.filter(app=app)
-        .order_by("-started_at")[:20]
-        .values("id", "status", "model", "country", "started_at", "finished_at", "error")
-    )
+    runs = list(AICopilotRun.objects.filter(app=app).order_by("-started_at")[:20])
     recommendations_qs = (
         AICopilotRecommendation.objects.filter(app=app)
         .select_related("created_keyword", "run")
@@ -1179,20 +1204,10 @@ def _copilot_payload_for_app(app: App):
             "id": app.id,
             "name": app.name,
             "track_id": app.track_id,
-            "asc_app_id": app.asc_app_id,
+            "asc_app_id": _effective_asc_app_id(app),
+            "asc_app_id_source": "asc_app_id" if str(app.asc_app_id or "").strip() else ("track_id" if app.track_id else "none"),
         },
-        "runs": [
-            {
-                "id": row["id"],
-                "status": row["status"],
-                "model": row["model"],
-                "country": row["country"],
-                "started_at": row["started_at"].isoformat() if row["started_at"] else None,
-                "finished_at": row["finished_at"].isoformat() if row["finished_at"] else None,
-                "error": row["error"],
-            }
-            for row in runs
-        ],
+        "runs": [_serialize_copilot_run(item) for item in runs],
         "recommendations": [_serialize_copilot_recommendation(item) for item in recommendations_qs],
         "metadata_variants": [_serialize_copilot_metadata_variant(item) for item in variants_qs],
         "asc_status": _asc_status_for_app(app),
@@ -1439,8 +1454,12 @@ def app_store_connect_sync_view(request):
         return JsonResponse({"error": "app_id is required."}, status=400)
 
     app = get_object_or_404(App, id=app_id)
-    if not app.asc_app_id:
-        return JsonResponse({"error": "This app is missing asc_app_id."}, status=400)
+    resolved_asc_app_id = _effective_asc_app_id(app)
+    if not resolved_asc_app_id:
+        return JsonResponse(
+            {"error": "This app is missing asc_app_id and has no track_id fallback."},
+            status=400,
+        )
 
     effective = _effective_ai_settings()
     if not effective["asc_configured"]:
@@ -1460,13 +1479,20 @@ def app_store_connect_sync_view(request):
     )
     try:
         service = _build_asc_service(effective)
-        rows_upserted = service.sync_app_metrics(app, days_back=days_back)
+        rows_upserted = service.sync_app_metrics(app, days_back=days_back, asc_app_id=resolved_asc_app_id)
         run.status = ASCSyncRun.STATUS_SUCCESS
         run.rows_upserted = rows_upserted
         run.finished_at = timezone.now()
         run.error = ""
         run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
     except (ASCAuthError, ASCError, ASCAPIError) as exc:
+        logger.warning(
+            "ASC sync failed for app=%s asc_app_id=%s days_back=%s: %s",
+            app.id,
+            resolved_asc_app_id,
+            days_back,
+            exc,
+        )
         run.status = ASCSyncRun.STATUS_FAILED
         run.rows_upserted = 0
         run.finished_at = timezone.now()
@@ -1474,7 +1500,12 @@ def app_store_connect_sync_view(request):
         run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
         return JsonResponse({"error": str(exc), "run": _serialize_asc_sync_run(run)}, status=400)
     except Exception as exc:  # pragma: no cover - defensive runtime path
-        logger.exception("ASC sync failed")
+        logger.exception(
+            "ASC sync crashed for app=%s asc_app_id=%s days_back=%s",
+            app.id,
+            resolved_asc_app_id,
+            days_back,
+        )
         run.status = ASCSyncRun.STATUS_FAILED
         run.rows_upserted = 0
         run.finished_at = timezone.now()
@@ -1516,6 +1547,34 @@ def ai_copilot_list_view(request):
     return JsonResponse(_copilot_payload_for_app(app))
 
 
+def ai_copilot_status_view(request):
+    app_id = request.GET.get("app_id")
+    if not app_id:
+        return JsonResponse({"error": "app_id is required."}, status=400)
+    app = _get_app_by_id_param(app_id)
+    if not app:
+        return JsonResponse({"error": "Valid app_id is required."}, status=400)
+
+    run_id_raw = request.GET.get("run_id")
+    run = None
+    if run_id_raw:
+        try:
+            run_id = int(run_id_raw)
+        except (TypeError, ValueError):
+            return JsonResponse({"error": "run_id must be an integer."}, status=400)
+        run = AICopilotRun.objects.filter(app=app, id=run_id).first()
+    if run is None:
+        run = AICopilotRun.objects.filter(app=app).order_by("-started_at").first()
+
+    return JsonResponse(
+        {
+            "app_id": app.id,
+            "run": _serialize_copilot_run(run),
+            "has_running_run": bool(run and run.status == AICopilotRun.STATUS_RUNNING),
+        }
+    )
+
+
 @require_POST
 def ai_copilot_generate_view(request):
     try:
@@ -1542,7 +1601,13 @@ def ai_copilot_generate_view(request):
         )
 
         asc_sync_payload = None
-        if sync_asc and app.asc_app_id and effective["asc_configured"]:
+        if sync_asc and not effective["asc_configured"]:
+            raise AICopilotError("App Store Connect credentials are not configured.")
+        resolved_asc_app_id = _effective_asc_app_id(app)
+        if sync_asc and not resolved_asc_app_id:
+            raise AICopilotError("This app is missing asc_app_id and has no track_id fallback.")
+
+        if sync_asc:
             asc_run = ASCSyncRun.objects.create(
                 app=app,
                 status=ASCSyncRun.STATUS_RUNNING,
@@ -1551,13 +1616,34 @@ def ai_copilot_generate_view(request):
             )
             try:
                 asc_service = _build_asc_service(effective)
-                rows_upserted = asc_service.sync_app_metrics(app, days_back=effective["asc_default_days_back"])
+                rows_upserted = asc_service.sync_app_metrics(
+                    app,
+                    days_back=effective["asc_default_days_back"],
+                    asc_app_id=resolved_asc_app_id,
+                )
                 asc_run.status = ASCSyncRun.STATUS_SUCCESS
                 asc_run.rows_upserted = rows_upserted
                 asc_run.finished_at = timezone.now()
                 asc_run.error = ""
                 asc_run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
+            except (ASCAuthError, ASCError, ASCAPIError) as exc:
+                logger.warning(
+                    "ASC pre-sync failed during copilot run for app=%s asc_app_id=%s: %s",
+                    app.id,
+                    resolved_asc_app_id,
+                    exc,
+                )
+                asc_run.status = ASCSyncRun.STATUS_FAILED
+                asc_run.rows_upserted = 0
+                asc_run.finished_at = timezone.now()
+                asc_run.error = str(exc)
+                asc_run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
             except Exception as exc:
+                logger.exception(
+                    "ASC pre-sync crashed during copilot run for app=%s asc_app_id=%s",
+                    app.id,
+                    resolved_asc_app_id,
+                )
                 asc_run.status = ASCSyncRun.STATUS_FAILED
                 asc_run.rows_upserted = 0
                 asc_run.finished_at = timezone.now()
@@ -1592,15 +1678,7 @@ def ai_copilot_generate_view(request):
     return JsonResponse(
         {
             "success": True,
-            "run": {
-                "id": run.id,
-                "status": run.status,
-                "model": run.model,
-                "country": run.country,
-                "started_at": run.started_at.isoformat() if run.started_at else None,
-                "finished_at": run.finished_at.isoformat() if run.finished_at else None,
-                "error": run.error,
-            },
+            "run": _serialize_copilot_run(run),
             "recommendations": recommendations,
             "metadata_variants": metadata_variants,
             "asc_sync": asc_sync_payload,

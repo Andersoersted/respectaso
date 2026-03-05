@@ -66,6 +66,17 @@
 
     <div id="ai-status" class="hidden bg-slate-800/50 border border-white/10 rounded-xl p-3 text-sm text-slate-200"></div>
 
+    <div id="ai-progress" class="hidden bg-slate-800/50 border border-white/10 rounded-xl p-3">
+        <div class="flex items-center justify-between text-xs">
+            <p id="ai-progress-title" class="text-slate-200 font-medium">Preparing Copilot run...</p>
+            <span id="ai-progress-percent" class="text-slate-400">0%</span>
+        </div>
+        <div class="h-2 bg-slate-700/70 rounded-full overflow-hidden mt-2" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div id="ai-progress-bar" class="h-full rounded-full bg-gradient-to-r from-cyan-500 to-purple-500 transition-all duration-500" style="width: 0%"></div>
+        </div>
+        <p id="ai-progress-detail" class="text-xs text-slate-400 mt-2">Building keyword snapshot and validating inputs.</p>
+    </div>
+
     <div class="bg-[#1e293b] border border-white/10 rounded-xl overflow-hidden">
         <div class="px-4 py-3 border-b border-white/10 flex items-center justify-between">
             <h2 class="text-base font-semibold text-white">App Store Connect Status</h2>
@@ -171,6 +182,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const syncBtn = document.getElementById('asc-sync-btn');
     const generateBtn = document.getElementById('ai-generate-btn');
     const statusEl = document.getElementById('ai-status');
+    const progressEl = document.getElementById('ai-progress');
+    const progressTitleEl = document.getElementById('ai-progress-title');
+    const progressPercentEl = document.getElementById('ai-progress-percent');
+    const progressBarEl = document.getElementById('ai-progress-bar');
+    const progressTrackEl = progressBarEl?.parentElement;
+    const progressDetailEl = document.getElementById('ai-progress-detail');
     const recoBody = document.getElementById('copilot-recommendations-body');
     const metadataBody = document.getElementById('copilot-metadata-body');
     const runsBody = document.getElementById('copilot-runs-body');
@@ -180,6 +197,22 @@ document.addEventListener('DOMContentLoaded', () => {
     const ascLatestSync = document.getElementById('asc-latest-sync');
     const ascRows = document.getElementById('asc-rows');
     const ascLatestDate = document.getElementById('asc-latest-date');
+    const COPILOT_STAGE_LABELS = {
+        queued: 'Queued',
+        preparing: 'Preparing run',
+        collecting_signals: 'Collecting keyword signals',
+        generating_recommendations: 'Generating AI recommendations',
+        scoring_recommendations: 'Scoring recommendations',
+        persisting_output: 'Saving output',
+        complete: 'Complete',
+        failed: 'Failed',
+    };
+    let progressPollInterval = null;
+    let progressPollInFlight = false;
+    let progressPollRunId = null;
+    let progressPollStartedAtMs = 0;
+    let progressValue = 0;
+    let progressLastRun = null;
 
     function fmtPct(value) {
         return `${Math.round((Number(value || 0)) * 100)}%`;
@@ -192,6 +225,99 @@ document.addEventListener('DOMContentLoaded', () => {
         else if (type === 'success') statusEl.classList.add('text-green-300', 'border-green-500/30', 'bg-green-900/20');
         else statusEl.classList.add('text-slate-200');
         statusEl.textContent = message;
+    }
+
+    function setProgress(value, title, detail) {
+        const clamped = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
+        progressValue = clamped;
+        progressEl.classList.remove('hidden');
+        progressTitleEl.textContent = title;
+        progressPercentEl.textContent = `${clamped}%`;
+        progressBarEl.style.width = `${clamped}%`;
+        progressDetailEl.textContent = detail;
+        if (progressTrackEl) {
+            progressTrackEl.setAttribute('aria-valuenow', String(clamped));
+        }
+    }
+
+    function stageLabel(stage) {
+        const key = String(stage || '').toLowerCase();
+        return COPILOT_STAGE_LABELS[key] || key.replace(/_/g, ' ').replace(/\b\w/g, (m) => m.toUpperCase()) || 'Running';
+    }
+
+    function stopProgressPolling() {
+        if (progressPollInterval) {
+            clearInterval(progressPollInterval);
+            progressPollInterval = null;
+        }
+    }
+
+    async function pollCopilotProgress(appId) {
+        if (progressPollInFlight) return;
+        progressPollInFlight = true;
+        try {
+            const params = new URLSearchParams({app_id: String(appId)});
+            if (progressPollRunId) params.set('run_id', String(progressPollRunId));
+            const resp = await fetch(`{% url "aso:ai_copilot_status" %}?${params.toString()}`);
+            const data = await resp.json();
+            if (!resp.ok) return;
+            const run = data.run || null;
+            if (!run) return;
+
+            const runStartedAtMs = run.started_at ? Date.parse(run.started_at) : 0;
+            if (!progressPollRunId && runStartedAtMs && runStartedAtMs + 1000 < progressPollStartedAtMs) {
+                return;
+            }
+
+            progressPollRunId = run.id;
+            progressLastRun = run;
+            setProgress(
+                Number(run.progress_percent || 0),
+                stageLabel(run.progress_stage || run.status),
+                run.progress_detail || 'Copilot run in progress.'
+            );
+
+            if (run.status && run.status !== 'running') {
+                stopProgressPolling();
+            }
+        } catch (_err) {
+            // Keep polling silently; final request error/success is shown by runCopilot.
+        } finally {
+            progressPollInFlight = false;
+        }
+    }
+
+    function startCopilotProgress(appId) {
+        stopProgressPolling();
+        progressPollInFlight = false;
+        progressPollRunId = null;
+        progressLastRun = null;
+        progressPollStartedAtMs = Date.now();
+        progressValue = 0;
+        setProgress(2, 'Preparing run', 'Waiting for server to start the Copilot run.');
+        pollCopilotProgress(appId);
+        progressPollInterval = setInterval(() => pollCopilotProgress(appId), 1200);
+    }
+
+    function finishCopilotProgress({ok, detail, run}) {
+        stopProgressPolling();
+        const finalRun = run || progressLastRun;
+        if (finalRun) {
+            const finalPercent = ok ? 100 : Math.max(Number(finalRun.progress_percent || 0), 8);
+            setProgress(
+                finalPercent,
+                stageLabel(ok ? 'complete' : (finalRun.progress_stage || finalRun.status || 'failed')),
+                finalRun.progress_detail || detail || (ok ? 'Copilot run finished.' : 'Copilot run failed.')
+            );
+        }
+        if (ok) {
+            setProgress(100, 'Complete', detail || 'Copilot run finished.');
+            setTimeout(() => {
+                progressEl.classList.add('hidden');
+            }, 1400);
+            return;
+        }
+        setProgress(Math.max(progressValue, 8), 'Failed', detail || 'Copilot run failed.');
     }
 
     function recommendationActionChip(action) {
@@ -279,11 +405,11 @@ document.addEventListener('DOMContentLoaded', () => {
         runsBody.innerHTML = runs.map((run) => `
             <tr class="border-b border-white/5">
                 <td class="px-3 py-2 text-xs text-slate-300">#${run.id}</td>
-                <td class="px-3 py-2 text-xs text-slate-300">${run.status}</td>
+                <td class="px-3 py-2 text-xs text-slate-300">${run.status}${run.status === 'running' ? ` (${run.progress_percent || 0}%)` : ''}</td>
                 <td class="px-3 py-2 text-xs text-slate-300">${run.model}</td>
                 <td class="px-3 py-2 text-xs text-slate-300">${String(run.country || '').toUpperCase()}</td>
                 <td class="px-3 py-2 text-xs text-slate-300">${run.started_at ? new Date(run.started_at).toLocaleString() : '—'}</td>
-                <td class="px-3 py-2 text-xs text-red-300">${run.error || '—'}</td>
+                <td class="px-3 py-2 text-xs ${run.error ? 'text-red-300' : 'text-slate-400'}">${run.error || run.progress_detail || '—'}</td>
             </tr>
         `).join('');
     }
@@ -335,6 +461,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!appId) return;
         generateBtn.disabled = true;
         syncBtn.disabled = true;
+        startCopilotProgress(appId);
         setStatus('Running AI Copilot. This may take a while.', 'info');
         try {
             const resp = await fetch('{% url "aso:ai_copilot_generate" %}', {
@@ -352,8 +479,18 @@ document.addEventListener('DOMContentLoaded', () => {
             renderRecommendations(data.recommendations || []);
             renderMetadataVariants(data.metadata_variants || []);
             await loadCopilotData();
+            finishCopilotProgress({
+                ok: true,
+                run: data.run || null,
+                detail: `Generated ${data.recommendations?.length || 0} recommendations and ${data.metadata_variants?.length || 0} metadata variants.`,
+            });
             setStatus(`Copilot generated ${data.recommendations?.length || 0} recommendations.`, 'success');
         } catch (err) {
+            finishCopilotProgress({
+                ok: false,
+                run: progressLastRun,
+                detail: err.message || 'Copilot generation failed.',
+            });
             setStatus(err.message || 'Copilot generation failed.', 'error');
         } finally {
             generateBtn.disabled = !appSelect.value;

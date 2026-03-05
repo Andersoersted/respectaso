@@ -121,10 +121,15 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "core.wsgi.application"
 
+SQLITE_TIMEOUT_SECONDS = float_env("SQLITE_TIMEOUT_SECONDS", 20.0, min_value=1.0, max_value=120.0)
+
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": DATA_DIR / "db.sqlite3",
+        "OPTIONS": {
+            "timeout": SQLITE_TIMEOUT_SECONDS,
+        },
     }
 }
 

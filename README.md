@@ -60,9 +60,9 @@ docker compose up -d
 
 That's it. The first startup takes a few seconds (database migration + static files).
 
-On first launch, the tool automatically:
+On startup, the tool automatically:
 - Generates a secure Django secret key
-- Runs database migrations
+- Checks for pending database migrations and applies them if needed
 - Collects static files
 - Starts the Gunicorn server
 
@@ -162,6 +162,7 @@ Set these in `.env` for AI Copilot, App Store Connect sync defaults, and retenti
 ```bash
 RESULT_RETENTION_DAYS=365
 AUTO_REFRESH_MODE=external
+SQLITE_TIMEOUT_SECONDS=20
 
 OPENAI_API_KEY=your_key_here
 OPENAI_MODEL=gpt-5-mini
@@ -193,7 +194,7 @@ AI Copilot can include your own App Store Connect analytics signals (impressions
 - `Issuer ID`
 - `Key ID`
 - private key PEM content
-2. Add your App Store Connect app ID to each app in RespectASO (`Apps` page, `ASC App ID` field).
+2. Add your App Store Connect app ID to each app in RespectASO (`Apps` page, `ASC App ID` field). Apps added via App Store lookup automatically fall back to `track_id` if ASC App ID is blank.
 3. Enter credentials on the RespectASO `Config` page.
 4. Use **Sync ASC** in AI Copilot before running recommendations.
 

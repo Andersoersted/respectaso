@@ -566,6 +566,9 @@ class AICopilotRun(models.Model):
 
     app = models.ForeignKey(App, on_delete=models.CASCADE, related_name="ai_copilot_runs")
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_RUNNING)
+    progress_percent = models.PositiveSmallIntegerField(default=0)
+    progress_stage = models.CharField(max_length=64, blank=True, default="queued")
+    progress_detail = models.CharField(max_length=255, blank=True, default="")
     model = models.CharField(max_length=100)
     country = models.CharField(max_length=5, default="us")
     input_snapshot_json = models.JSONField(default=dict)

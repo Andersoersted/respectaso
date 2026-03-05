@@ -220,7 +220,35 @@ def _build_snapshot(app: App, country: str, feature_rows: list[dict[str, Any]], 
     }
 
 
-@transaction.atomic
+def _update_run_fields(run: AICopilotRun, **fields):
+    if not fields:
+        return
+    AICopilotRun.objects.filter(id=run.id).update(**fields)
+    for key, value in fields.items():
+        setattr(run, key, value)
+
+
+def _set_run_progress(run: AICopilotRun, *, percent: int, stage: str, detail: str):
+    _update_run_fields(
+        run,
+        progress_percent=max(0, min(100, int(percent))),
+        progress_stage=(stage or "running")[:64],
+        progress_detail=(detail or "")[:255],
+    )
+
+
+def _mark_run_failed(run: AICopilotRun, error: str):
+    _update_run_fields(
+        run,
+        status=AICopilotRun.STATUS_FAILED,
+        finished_at=timezone.now(),
+        error=str(error or ""),
+        progress_percent=max(5, int(run.progress_percent or 0)),
+        progress_stage="failed",
+        progress_detail=_truncate_chars(str(error or "Copilot run failed."), 255),
+    )
+
+
 def generate_ai_copilot(
     app: App,
     *,
@@ -228,22 +256,50 @@ def generate_ai_copilot(
     settings_obj: CopilotSettings,
 ) -> AICopilotRun:
     country = (country or "us").lower()
-    feature_rows, feature_summary = build_keyword_feature_rows(app=app, country=country)
-    if not feature_rows:
-        raise AICopilotError("No tracked keyword history exists for this app and country.")
-
-    snapshot = _build_snapshot(app, country, feature_rows, feature_summary)
     run = AICopilotRun.objects.create(
         app=app,
         status=AICopilotRun.STATUS_RUNNING,
+        progress_percent=2,
+        progress_stage="preparing",
+        progress_detail="Validating inputs and preparing run.",
         model=settings_obj.model,
         country=country,
-        input_snapshot_json=snapshot,
-        feature_summary_json=feature_summary,
+        input_snapshot_json={},
+        feature_summary_json={},
     )
 
     try:
+        _set_run_progress(
+            run,
+            percent=12,
+            stage="collecting_signals",
+            detail="Collecting keyword history and ASC analytics signals.",
+        )
+        feature_rows, feature_summary = build_keyword_feature_rows(app=app, country=country)
+        if not feature_rows:
+            raise AICopilotError("No tracked keyword history exists for this app and country.")
+
+        snapshot = _build_snapshot(app, country, feature_rows, feature_summary)
+        _update_run_fields(
+            run,
+            input_snapshot_json=snapshot,
+            feature_summary_json=feature_summary,
+        )
+
+        _set_run_progress(
+            run,
+            percent=34,
+            stage="generating_recommendations",
+            detail="Requesting structured recommendations from the model.",
+        )
         output = _generate_with_openai(snapshot=snapshot, settings_obj=settings_obj)
+
+        _set_run_progress(
+            run,
+            percent=58,
+            stage="scoring_recommendations",
+            detail="Scoring and deduplicating recommendation candidates.",
+        )
         base_rows = {row["keyword"]: row for row in feature_rows}
         business_default = feature_rows[0]["score_business_impact"] if feature_rows else 0.25
         seen_keywords = set()
@@ -309,7 +365,6 @@ def generate_ai_copilot(
         if not rec_objects:
             raise AICopilotError("Copilot returned no usable recommendations.")
         rec_objects.sort(key=lambda item: item.score_overall, reverse=True)
-        AICopilotRecommendation.objects.bulk_create(rec_objects[:30])
 
         variant_objects: list[AICopilotMetadataVariant] = []
         for variant in output.metadata_variants[:6]:
@@ -350,20 +405,33 @@ def generate_ai_copilot(
                 )
             ]
         variant_objects.sort(key=lambda item: item.predicted_impact, reverse=True)
-        AICopilotMetadataVariant.objects.bulk_create(variant_objects[:3])
 
-        run.status = AICopilotRun.STATUS_SUCCESS
-        run.finished_at = timezone.now()
-        run.error = ""
-        run.save(update_fields=["status", "finished_at", "error"])
+        _set_run_progress(
+            run,
+            percent=82,
+            stage="persisting_output",
+            detail="Saving recommendations and metadata variants.",
+        )
+        with transaction.atomic():
+            AICopilotRecommendation.objects.bulk_create(rec_objects[:30])
+            AICopilotMetadataVariant.objects.bulk_create(variant_objects[:3])
+            _update_run_fields(
+                run,
+                status=AICopilotRun.STATUS_SUCCESS,
+                finished_at=timezone.now(),
+                error="",
+                progress_percent=100,
+                progress_stage="complete",
+                progress_detail="Copilot run completed successfully.",
+            )
         return run
+    except AICopilotError as exc:
+        _mark_run_failed(run, str(exc))
+        logger.warning("AI copilot run %s failed for app %s: %s", run.id, app.id, exc)
+        raise
     except Exception as exc:
-        run.status = AICopilotRun.STATUS_FAILED
-        run.finished_at = timezone.now()
-        run.error = str(exc)
-        run.save(update_fields=["status", "finished_at", "error"])
-        if isinstance(exc, AICopilotError):
-            raise
+        _mark_run_failed(run, str(exc))
+        logger.exception("AI copilot run %s failed unexpectedly for app %s", run.id, app.id)
         raise AICopilotError(str(exc)) from exc
 
 

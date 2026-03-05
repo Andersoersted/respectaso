@@ -642,6 +642,7 @@ class AppStoreConnectEndpointTests(TestCase):
         payload = response.json()
         self.assertEqual(payload["app_id"], self.app.id)
         self.assertEqual(payload["metric_rows"], 1)
+        self.assertEqual(payload["asc_app_id"], "1234567890")
 
     @patch("aso.views.AppStoreConnectService.sync_app_metrics")
     def test_sync_endpoint_creates_run(self, mock_sync):
@@ -660,13 +661,28 @@ class AppStoreConnectEndpointTests(TestCase):
         self.assertEqual(run.status, ASCSyncRun.STATUS_SUCCESS)
 
     def test_sync_endpoint_rejects_missing_asc_app_id(self):
-        app = App.objects.create(name="No ASC", track_id=202020, asc_app_id="")
+        app = App.objects.create(name="No ASC", track_id=None, asc_app_id="")
         response = self.client.post(
             reverse("aso:app_store_connect_sync"),
             data=json.dumps({"app_id": app.id}),
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 400)
+
+    @patch("aso.views.AppStoreConnectService.sync_app_metrics")
+    def test_sync_endpoint_uses_track_id_fallback_for_asc_app_id(self, mock_sync):
+        app = App.objects.create(name="Fallback ASC", track_id=202020, asc_app_id="")
+        mock_sync.return_value = 3
+        response = self.client.post(
+            reverse("aso:app_store_connect_sync"),
+            data=json.dumps({"app_id": app.id}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["success"])
+        mock_sync.assert_called_once()
+        _args, kwargs = mock_sync.call_args
+        self.assertEqual(kwargs["asc_app_id"], "202020")
 
 
 class AICopilotEndpointTests(TestCase):
@@ -711,6 +727,14 @@ class AICopilotEndpointTests(TestCase):
         self.assertEqual(payload["app"]["id"], self.app.id)
         self.assertGreaterEqual(len(payload["recommendations"]), 1)
         self.assertGreaterEqual(len(payload["metadata_variants"]), 1)
+        self.assertIn("progress_percent", payload["runs"][0])
+
+    def test_status_endpoint_returns_latest_run(self):
+        response = self.client.get(reverse("aso:ai_copilot_status"), {"app_id": self.app.id})
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["app_id"], self.app.id)
+        self.assertEqual(payload["run"]["id"], self.run.id)
 
     @patch("aso.views.generate_ai_copilot")
     def test_generate_endpoint_returns_run_payload(self, mock_generate):
