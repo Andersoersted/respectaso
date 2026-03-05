@@ -55,6 +55,7 @@ from .refresh_service import run_refresh
 
 logger = logging.getLogger(__name__)
 BULK_REFRESH_STALE_HOURS = 4
+COPILOT_STALE_MINUTES = 45
 
 
 def _run_bulk_refresh_in_background(*, run_id: int, pairs: list[tuple[int, str]]) -> None:
@@ -77,6 +78,141 @@ def _run_bulk_refresh_in_background(*, run_id: int, pairs: list[tuple[int, str]]
         )
     finally:
         close_old_connections()
+
+
+def _mark_copilot_run_failed(*, run_id: int, message: str) -> None:
+    current = AICopilotRun.objects.filter(pk=run_id).values_list("progress_percent", flat=True).first() or 0
+    AICopilotRun.objects.filter(pk=run_id).update(
+        status=AICopilotRun.STATUS_FAILED,
+        finished_at=timezone.now(),
+        error=str(message or "Copilot run failed."),
+        progress_percent=max(5, int(current)),
+        progress_stage="failed",
+        progress_detail=str(message or "Copilot run failed.")[:255],
+    )
+
+
+def _run_copilot_in_background(
+    *,
+    run_id: int,
+    app_id: int,
+    country: str,
+    model: str,
+    sync_asc: bool,
+    effective_settings: dict,
+) -> None:
+    close_old_connections()
+    try:
+        app = App.objects.get(pk=app_id)
+        run = AICopilotRun.objects.get(pk=run_id)
+
+        if sync_asc:
+            AICopilotRun.objects.filter(pk=run_id, status=AICopilotRun.STATUS_RUNNING).update(
+                progress_percent=8,
+                progress_stage="syncing_asc",
+                progress_detail="Syncing App Store Connect analytics before generation.",
+            )
+            resolved_asc_app_id = _effective_asc_app_id(app)
+            if not resolved_asc_app_id:
+                raise AICopilotError("This app is missing asc_app_id and has no track_id fallback.")
+
+            asc_run = ASCSyncRun.objects.create(
+                app=app,
+                status=ASCSyncRun.STATUS_RUNNING,
+                days_back=effective_settings["asc_default_days_back"],
+                rows_upserted=0,
+            )
+            try:
+                asc_service = _build_asc_service(effective_settings)
+                rows_upserted = asc_service.sync_app_metrics(
+                    app,
+                    days_back=effective_settings["asc_default_days_back"],
+                    asc_app_id=resolved_asc_app_id,
+                )
+                asc_run.status = ASCSyncRun.STATUS_SUCCESS
+                asc_run.rows_upserted = rows_upserted
+                asc_run.finished_at = timezone.now()
+                asc_run.error = ""
+                asc_run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
+            except (ASCAuthError, ASCError, ASCAPIError) as exc:
+                logger.warning(
+                    "ASC pre-sync failed during background copilot run for app=%s asc_app_id=%s: %s",
+                    app.id,
+                    resolved_asc_app_id,
+                    exc,
+                )
+                asc_run.status = ASCSyncRun.STATUS_FAILED
+                asc_run.rows_upserted = 0
+                asc_run.finished_at = timezone.now()
+                asc_run.error = str(exc)
+                asc_run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
+                AICopilotRun.objects.filter(pk=run_id, status=AICopilotRun.STATUS_RUNNING).update(
+                    progress_percent=12,
+                    progress_stage="asc_sync_failed",
+                    progress_detail=f"ASC pre-sync failed ({exc}); continuing with existing data."[:255],
+                )
+            except Exception as exc:
+                logger.exception(
+                    "ASC pre-sync crashed during background copilot run for app=%s asc_app_id=%s",
+                    app.id,
+                    resolved_asc_app_id,
+                )
+                asc_run.status = ASCSyncRun.STATUS_FAILED
+                asc_run.rows_upserted = 0
+                asc_run.finished_at = timezone.now()
+                asc_run.error = str(exc)
+                asc_run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
+                AICopilotRun.objects.filter(pk=run_id, status=AICopilotRun.STATUS_RUNNING).update(
+                    progress_percent=12,
+                    progress_stage="asc_sync_failed",
+                    progress_detail="ASC pre-sync failed unexpectedly; continuing with existing data.",
+                )
+
+        run.refresh_from_db()
+        generate_ai_copilot(
+            app,
+            country=country,
+            settings_obj=CopilotSettings(
+                model=model,
+                api_key=effective_settings["api_key"],
+                system_prompt=effective_settings["system_prompt"],
+                user_prompt_template=effective_settings["user_prompt_template"],
+            ),
+            run=run,
+        )
+    except AICopilotError as exc:
+        logger.warning("AI copilot background run %s failed for app %s: %s", run_id, app_id, exc)
+        _mark_copilot_run_failed(run_id=run_id, message=str(exc))
+    except Exception as exc:  # pragma: no cover - defensive runtime path
+        logger.exception("AI copilot background run %s crashed for app %s", run_id, app_id)
+        _mark_copilot_run_failed(run_id=run_id, message=str(exc))
+    finally:
+        close_old_connections()
+
+
+def _start_copilot_background_run(
+    *,
+    run_id: int,
+    app_id: int,
+    country: str,
+    model: str,
+    sync_asc: bool,
+    effective_settings: dict,
+) -> None:
+    thread = threading.Thread(
+        target=_run_copilot_in_background,
+        kwargs={
+            "run_id": run_id,
+            "app_id": app_id,
+            "country": country,
+            "model": model,
+            "sync_asc": sync_asc,
+            "effective_settings": effective_settings,
+        },
+        daemon=True,
+        name=f"copilot-run-{run_id}",
+    )
+    thread.start()
 
 
 # app_rank is now persisted directly on SearchResult during search/refresh.
@@ -125,6 +261,170 @@ def config_view(request):
             "effective_asc_default_days_back": effective["asc_default_days_back"],
         },
     )
+
+
+def _openai_test_error_payload(exc: Exception) -> tuple[dict, int]:
+    status_code = getattr(exc, "status_code", None)
+    request_id = getattr(exc, "request_id", None)
+    response = getattr(exc, "response", None)
+    response_text = getattr(response, "text", None) if response is not None else None
+    body_obj = getattr(exc, "body", None)
+    body_excerpt = ""
+    if response_text:
+        body_excerpt = str(response_text).replace("\n", " ").strip()[:320]
+    elif body_obj:
+        if isinstance(body_obj, (dict, list)):
+            body_excerpt = json.dumps(body_obj, ensure_ascii=True)[:320]
+        else:
+            body_excerpt = str(body_obj).replace("\n", " ").strip()[:320]
+
+    message = str(exc or "").strip() or exc.__class__.__name__
+    lower = f"{message} {body_excerpt}".lower()
+
+    def _is_openai_exc(name: str) -> bool:
+        try:
+            import openai
+        except Exception:  # pragma: no cover - import guard
+            return False
+        exc_type = getattr(openai, name, None)
+        return isinstance(exc_type, type) and isinstance(exc, exc_type)
+
+    payload = {
+        "success": False,
+        "error": f"OpenAI request failed: {message}",
+        "error_kind": "openai_error",
+        "status_code": status_code,
+        "request_id": request_id,
+        "error_type": exc.__class__.__name__,
+        "detail": body_excerpt or None,
+    }
+    http_status = 502
+
+    if _is_openai_exc("APITimeoutError") or "timed out" in lower or "timeout" in lower:
+        payload["error"] = (
+            "OpenAI request timed out. Retry, or increase OPENAI_TIMEOUT_SECONDS in Config/env."
+        )
+        payload["error_kind"] = "timeout"
+        http_status = 504
+    elif _is_openai_exc("APIConnectionError"):
+        payload["error"] = "Could not connect to OpenAI. Check network egress and retry."
+        payload["error_kind"] = "connection"
+        http_status = 503
+    elif _is_openai_exc("RateLimitError") or status_code == 429 or "insufficient_quota" in lower or "quota" in lower:
+        payload["error"] = "OpenAI quota or rate limit was hit. Check billing/usage and retry."
+        payload["error_kind"] = "quota_or_rate_limit"
+        http_status = 429
+    elif _is_openai_exc("AuthenticationError") or status_code == 401 or "invalid api key" in lower:
+        payload["error"] = "OpenAI authentication failed. Verify OPENAI_API_KEY."
+        payload["error_kind"] = "authentication"
+        http_status = 400
+    elif _is_openai_exc("PermissionDeniedError") or status_code == 403:
+        payload["error"] = "OpenAI request was forbidden for this key/model. Check project permissions."
+        payload["error_kind"] = "permission"
+        http_status = 400
+    elif _is_openai_exc("BadRequestError") or status_code == 400:
+        payload["error"] = f"OpenAI rejected the request: {message}"
+        payload["error_kind"] = "bad_request"
+        http_status = 400
+    elif status_code and int(status_code) >= 500:
+        payload["error"] = "OpenAI service is temporarily unavailable. Please retry."
+        payload["error_kind"] = "upstream_unavailable"
+        http_status = 503
+
+    return payload, http_status
+
+
+@require_POST
+def config_openai_test_view(request):
+    try:
+        body = json.loads(request.body or "{}")
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+    effective = _effective_ai_settings()
+    api_key_override = str(body.get("api_key") or "").strip()
+    api_key = api_key_override or effective["api_key"]
+    if not api_key:
+        return JsonResponse(
+            {
+                "success": False,
+                "error": "OpenAI API key is not configured. Add one in Config or OPENAI_API_KEY.",
+                "error_kind": "missing_api_key",
+            },
+            status=400,
+        )
+
+    allowed_models_override = _parse_csv_models(body.get("available_models"))
+    allowed_models = allowed_models_override or effective["available_models"]
+    try:
+        selected_model = _resolve_model_choice(
+            body.get("model"),
+            default_model=effective["default_model"],
+            allowed_models=allowed_models,
+        )
+    except AISuggestionError as exc:
+        return JsonResponse({"success": False, "error": str(exc), "error_kind": "invalid_model"}, status=400)
+
+    try:
+        from openai import OpenAI
+    except Exception as exc:  # pragma: no cover - import guard
+        return JsonResponse(
+            {
+                "success": False,
+                "error": "OpenAI SDK is not installed. Add `openai` to requirements.",
+                "error_kind": "sdk_missing",
+                "detail": str(exc),
+            },
+            status=500,
+        )
+
+    started = time.perf_counter()
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            timeout=settings.OPENAI_TIMEOUT_SECONDS,
+            max_retries=settings.OPENAI_MAX_RETRIES,
+        )
+        response = client.with_options(
+            timeout=min(float(settings.OPENAI_TIMEOUT_SECONDS), 30.0),
+            max_retries=settings.OPENAI_MAX_RETRIES,
+        ).responses.create(
+            model=selected_model,
+            input="Reply with a short confirmation that this model is reachable.",
+            max_output_tokens=32,
+        )
+        elapsed = round(time.perf_counter() - started, 2)
+        output_text = (getattr(response, "output_text", "") or "").strip()
+        request_id = getattr(response, "_request_id", None)
+        logger.warning(
+            "OpenAI config test succeeded model=%s request_id=%s elapsed=%.2fs output=%s",
+            selected_model,
+            request_id or "-",
+            elapsed,
+            output_text[:120] or "-",
+        )
+        return JsonResponse(
+            {
+                "success": True,
+                "model": selected_model,
+                "elapsed_seconds": elapsed,
+                "request_id": request_id,
+                "output_preview": output_text[:240],
+            }
+        )
+    except Exception as exc:
+        payload, http_status = _openai_test_error_payload(exc)
+        payload["model"] = selected_model
+        payload["elapsed_seconds"] = round(time.perf_counter() - started, 2)
+        logger.warning(
+            "OpenAI config test failed model=%s kind=%s status=%s request_id=%s detail=%s",
+            selected_model,
+            payload.get("error_kind"),
+            payload.get("status_code"),
+            payload.get("request_id") or "-",
+            exc,
+        )
+        return JsonResponse(payload, status=http_status)
 
 
 def dashboard_view(request):
@@ -1599,90 +1899,85 @@ def ai_copilot_generate_view(request):
             default_model=effective["default_model"],
             allowed_models=effective["available_models"],
         )
-
-        asc_sync_payload = None
         if sync_asc and not effective["asc_configured"]:
             raise AICopilotError("App Store Connect credentials are not configured.")
         resolved_asc_app_id = _effective_asc_app_id(app)
         if sync_asc and not resolved_asc_app_id:
             raise AICopilotError("This app is missing asc_app_id and has no track_id fallback.")
-
-        if sync_asc:
-            asc_run = ASCSyncRun.objects.create(
-                app=app,
-                status=ASCSyncRun.STATUS_RUNNING,
-                days_back=effective["asc_default_days_back"],
-                rows_upserted=0,
+        stale_cutoff = timezone.now() - timedelta(minutes=COPILOT_STALE_MINUTES)
+        running_run = AICopilotRun.objects.filter(app=app, status=AICopilotRun.STATUS_RUNNING).order_by("-started_at").first()
+        if running_run and running_run.started_at and running_run.started_at < stale_cutoff:
+            logger.warning(
+                "Marking stale copilot run %s as failed for app=%s (started_at=%s, cutoff=%s)",
+                running_run.id,
+                app.id,
+                running_run.started_at.isoformat(),
+                stale_cutoff.isoformat(),
             )
-            try:
-                asc_service = _build_asc_service(effective)
-                rows_upserted = asc_service.sync_app_metrics(
-                    app,
-                    days_back=effective["asc_default_days_back"],
-                    asc_app_id=resolved_asc_app_id,
-                )
-                asc_run.status = ASCSyncRun.STATUS_SUCCESS
-                asc_run.rows_upserted = rows_upserted
-                asc_run.finished_at = timezone.now()
-                asc_run.error = ""
-                asc_run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
-            except (ASCAuthError, ASCError, ASCAPIError) as exc:
-                logger.warning(
-                    "ASC pre-sync failed during copilot run for app=%s asc_app_id=%s: %s",
-                    app.id,
-                    resolved_asc_app_id,
-                    exc,
-                )
-                asc_run.status = ASCSyncRun.STATUS_FAILED
-                asc_run.rows_upserted = 0
-                asc_run.finished_at = timezone.now()
-                asc_run.error = str(exc)
-                asc_run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
-            except Exception as exc:
-                logger.exception(
-                    "ASC pre-sync crashed during copilot run for app=%s asc_app_id=%s",
-                    app.id,
-                    resolved_asc_app_id,
-                )
-                asc_run.status = ASCSyncRun.STATUS_FAILED
-                asc_run.rows_upserted = 0
-                asc_run.finished_at = timezone.now()
-                asc_run.error = str(exc)
-                asc_run.save(update_fields=["status", "rows_upserted", "finished_at", "error"])
-            asc_sync_payload = _serialize_asc_sync_run(asc_run)
+            _mark_copilot_run_failed(
+                run_id=running_run.id,
+                message=(
+                    "Marked failed because an older background run exceeded the stale threshold "
+                    f"({COPILOT_STALE_MINUTES}m)."
+                ),
+            )
+            running_run = None
 
-        run = generate_ai_copilot(
-            app,
+        if running_run:
+            return JsonResponse(
+                {
+                    "error": "A Copilot run is already in progress for this app.",
+                    "run": _serialize_copilot_run(running_run),
+                    "has_running_run": True,
+                },
+                status=409,
+            )
+
+        run = AICopilotRun.objects.create(
+            app=app,
+            status=AICopilotRun.STATUS_RUNNING,
+            progress_percent=1,
+            progress_stage="queued",
+            progress_detail="Queued. Starting background copilot run.",
+            model=selected_model,
             country=selected_country,
-            settings_obj=CopilotSettings(
-                model=selected_model,
-                api_key=effective["api_key"],
-                system_prompt=effective["system_prompt"],
-                user_prompt_template=effective["user_prompt_template"],
-            ),
+            input_snapshot_json={},
+            feature_summary_json={},
         )
-    except (AISuggestionError, AICopilotError) as exc:
+
+        _start_copilot_background_run(
+            run_id=run.id,
+            app_id=app.id,
+            country=selected_country,
+            model=selected_model,
+            sync_asc=sync_asc,
+            effective_settings={
+                "api_key": effective["api_key"],
+                "system_prompt": effective["system_prompt"],
+                "user_prompt_template": effective["user_prompt_template"],
+                "asc_key_id": effective["asc_key_id"],
+                "asc_issuer_id": effective["asc_issuer_id"],
+                "asc_private_key": effective["asc_private_key"],
+                "asc_default_days_back": effective["asc_default_days_back"],
+            },
+        )
+    except AISuggestionError as exc:
         return JsonResponse({"error": str(exc)}, status=400)
+    except AICopilotError as exc:
+        status_code = 400 if exc.user_error else 503
+        return JsonResponse({"error": str(exc)}, status=status_code)
     except Exception as exc:  # pragma: no cover - defensive runtime path
         logger.exception("AI copilot generation failed.")
         return JsonResponse({"error": str(exc)}, status=500)
 
-    recommendations = [
-        _serialize_copilot_recommendation(item)
-        for item in run.recommendations.select_related("created_keyword").order_by("-score_overall")
-    ]
-    metadata_variants = [
-        _serialize_copilot_metadata_variant(item)
-        for item in run.metadata_variants.order_by("-predicted_impact")
-    ]
     return JsonResponse(
         {
             "success": True,
+            "started": True,
             "run": _serialize_copilot_run(run),
-            "recommendations": recommendations,
-            "metadata_variants": metadata_variants,
-            "asc_sync": asc_sync_payload,
-        }
+            "has_running_run": True,
+        },
+        status=202,
     )
 
 

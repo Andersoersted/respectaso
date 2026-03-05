@@ -576,6 +576,63 @@ class RuntimeConfigViewTests(TestCase):
         cfg.refresh_from_db()
         self.assertEqual(cfg.openai_api_key, "sk-new-456")
 
+    @override_settings(OPENAI_API_KEY="sk-env-123", OPENAI_MODEL="gpt-5-mini", OPENAI_AVAILABLE_MODELS=["gpt-5-mini"])
+    @patch("openai.OpenAI")
+    def test_config_openai_test_endpoint_success(self, mock_openai):
+        response_obj = type("Response", (), {"output_text": "ok", "_request_id": "req_test_123"})()
+        client = mock_openai.return_value
+        client.with_options.return_value = client
+        client.responses.create.return_value = response_obj
+
+        response = self.client.post(
+            reverse("aso:config_openai_test"),
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["model"], "gpt-5-mini")
+        self.assertEqual(payload["request_id"], "req_test_123")
+        client.responses.create.assert_called_once()
+
+    @override_settings(OPENAI_API_KEY="")
+    def test_config_openai_test_endpoint_requires_api_key(self):
+        response = self.client.post(
+            reverse("aso:config_openai_test"),
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+        payload = response.json()
+        self.assertEqual(payload["error_kind"], "missing_api_key")
+
+    @override_settings(OPENAI_API_KEY="sk-env-123", OPENAI_MODEL="gpt-5-mini", OPENAI_AVAILABLE_MODELS=["gpt-5-mini"])
+    @patch("openai.OpenAI")
+    def test_config_openai_test_endpoint_surfaces_quota_errors(self, mock_openai):
+        class QuotaError(Exception):
+            pass
+
+        err = QuotaError("insufficient_quota")
+        err.status_code = 429
+        err.request_id = "req_quota_123"
+        err.body = {"error": {"code": "insufficient_quota"}}
+
+        client = mock_openai.return_value
+        client.with_options.return_value = client
+        client.responses.create.side_effect = err
+
+        response = self.client.post(
+            reverse("aso:config_openai_test"),
+            data=json.dumps({}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 429)
+        payload = response.json()
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error_kind"], "quota_or_rate_limit")
+        self.assertEqual(payload["request_id"], "req_quota_123")
+
 
 class DashboardServerSortTests(TestCase):
     def test_popularity_sort_is_global_before_pagination(self):
@@ -736,18 +793,69 @@ class AICopilotEndpointTests(TestCase):
         self.assertEqual(payload["app_id"], self.app.id)
         self.assertEqual(payload["run"]["id"], self.run.id)
 
-    @patch("aso.views.generate_ai_copilot")
-    def test_generate_endpoint_returns_run_payload(self, mock_generate):
-        mock_generate.return_value = self.run
+    @patch("aso.views._start_copilot_background_run")
+    def test_generate_endpoint_returns_run_payload(self, mock_start):
         response = self.client.post(
             reverse("aso:ai_copilot_generate"),
             data=json.dumps({"app_id": self.app.id, "country": "us", "model": "gpt-5-mini"}),
             content_type="application/json",
         )
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 202)
         payload = response.json()
         self.assertTrue(payload["success"])
-        self.assertEqual(payload["run"]["id"], self.run.id)
+        self.assertTrue(payload["has_running_run"])
+        self.assertEqual(payload["run"]["status"], AICopilotRun.STATUS_RUNNING)
+        mock_start.assert_called_once()
+
+    @patch("aso.views._start_copilot_background_run")
+    def test_generate_endpoint_returns_conflict_when_run_is_already_running(self, mock_start):
+        running = AICopilotRun.objects.create(
+            app=self.app,
+            status=AICopilotRun.STATUS_RUNNING,
+            progress_percent=34,
+            progress_stage="generating_recommendations",
+            progress_detail="Running",
+            model="gpt-5-mini",
+            country="us",
+            input_snapshot_json={},
+            feature_summary_json={},
+        )
+        response = self.client.post(
+            reverse("aso:ai_copilot_generate"),
+            data=json.dumps({"app_id": self.app.id, "country": "us", "model": "gpt-5-mini"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 409)
+        payload = response.json()
+        self.assertEqual(payload["run"]["id"], running.id)
+        self.assertTrue(payload["has_running_run"])
+        mock_start.assert_not_called()
+
+    @patch("aso.views._start_copilot_background_run")
+    def test_generate_endpoint_marks_stale_running_run_failed_and_starts_new(self, mock_start):
+        stale = AICopilotRun.objects.create(
+            app=self.app,
+            status=AICopilotRun.STATUS_RUNNING,
+            progress_percent=34,
+            progress_stage="generating_recommendations",
+            progress_detail="Running",
+            model="gpt-5-mini",
+            country="us",
+            input_snapshot_json={},
+            feature_summary_json={},
+        )
+        AICopilotRun.objects.filter(pk=stale.id).update(started_at=timezone.now() - timedelta(hours=5))
+
+        response = self.client.post(
+            reverse("aso:ai_copilot_generate"),
+            data=json.dumps({"app_id": self.app.id, "country": "us", "model": "gpt-5-mini"}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 202)
+        stale.refresh_from_db()
+        self.assertEqual(stale.status, AICopilotRun.STATUS_FAILED)
+        self.assertIn("stale threshold", stale.error.lower())
+        mock_start.assert_called_once()
 
     def test_recommendation_accept_and_reject_endpoints(self):
         accept_resp = self.client.post(

@@ -78,6 +78,15 @@
                 <label for="{{ form.openai_default_model.id_for_label }}" class="block text-xs font-medium text-slate-300 mb-1.5">{{ form.openai_default_model.label }}</label>
                 {{ form.openai_default_model }}
                 <p class="text-xs text-slate-500 mt-1">Leave empty to use <code>OPENAI_MODEL</code> from environment.</p>
+                <div class="mt-2 flex items-center gap-2">
+                    <button id="openai-test-btn"
+                            type="button"
+                            class="bg-cyan-600/20 hover:bg-cyan-600/30 text-cyan-300 text-xs font-medium px-3 py-1.5 rounded-lg transition-colors">
+                        Test Selected Model
+                    </button>
+                    <span class="text-xs text-slate-500">Uses current form values, including unsaved key/model changes.</span>
+                </div>
+                <div id="openai-test-result" class="hidden mt-2 rounded-lg border border-white/10 bg-slate-800/60 px-3 py-2 text-xs text-slate-300"></div>
             </div>
 
             <div>
@@ -170,6 +179,71 @@ document.addEventListener('DOMContentLoaded', function() {
         const el = document.getElementById(id);
         if (el) el.checked = false;
     });
+
+    const csrf = document.querySelector('[name=csrfmiddlewaretoken]')?.value || '';
+    const testBtn = document.getElementById('openai-test-btn');
+    const testResult = document.getElementById('openai-test-result');
+    const apiKeyInput = document.getElementById('{{ form.openai_api_key.id_for_label }}');
+    const modelInput = document.getElementById('{{ form.openai_default_model.id_for_label }}');
+    const availableModelsInput = document.getElementById('{{ form.openai_available_models.id_for_label }}');
+
+    function setTestResult(message, type) {
+        if (!testResult) return;
+        testResult.classList.remove('hidden', 'text-slate-300', 'text-green-300', 'text-red-300', 'border-green-500/30', 'border-red-500/30', 'border-white/10');
+        testResult.classList.add('border');
+        if (type === 'success') {
+            testResult.classList.add('text-green-300', 'border-green-500/30');
+        } else if (type === 'error') {
+            testResult.classList.add('text-red-300', 'border-red-500/30');
+        } else {
+            testResult.classList.add('text-slate-300', 'border-white/10');
+        }
+        testResult.textContent = message;
+    }
+
+    async function readJsonResponse(resp, label) {
+        const rawText = await resp.text();
+        if (!rawText) return {};
+        try {
+            return JSON.parse(rawText);
+        } catch (_err) {
+            const snippet = String(rawText || '').replace(/\s+/g, ' ').trim().slice(0, 220);
+            throw new Error(`${label} returned non-JSON response (HTTP ${resp.status}). ${snippet || 'No details available.'}`);
+        }
+    }
+
+    if (testBtn) {
+        testBtn.addEventListener('click', async function() {
+            testBtn.disabled = true;
+            setTestResult('Testing selected model connectivity...', 'info');
+            try {
+                const resp = await fetch('{% url "aso:config_openai_test" %}', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrf},
+                    body: JSON.stringify({
+                        model: modelInput?.value || '',
+                        api_key: apiKeyInput?.value || '',
+                        available_models: availableModelsInput?.value || '',
+                    }),
+                });
+                const data = await readJsonResponse(resp, 'OpenAI config test');
+                if (!resp.ok) {
+                    const detail = data.request_id ? ` (request_id=${data.request_id})` : '';
+                    throw new Error((data.error || 'OpenAI model test failed.') + detail);
+                }
+                const req = data.request_id ? `request_id=${data.request_id}` : 'request_id=unavailable';
+                const output = data.output_preview ? ` · reply: ${data.output_preview}` : '';
+                setTestResult(
+                    `Success: model ${data.model} responded in ${data.elapsed_seconds}s (${req})${output}`,
+                    'success'
+                );
+            } catch (err) {
+                setTestResult(err.message || 'OpenAI model test failed.', 'error');
+            } finally {
+                testBtn.disabled = false;
+            }
+        });
+    }
 });
 </script>
 {% endblock %}

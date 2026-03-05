@@ -41,6 +41,7 @@ urlpatterns = [
         name="app_store_connect_status",
     ),
     path("config/", views.config_view, name="config"),
+    path("config/openai/test/", views.config_openai_test_view, name="config_openai_test"),
     path("methodology/", views.methodology_view, name="methodology"),
     path("setup/", views.setup_view, name="setup"),
     path("search/", views.search_view, name="search"),

@@ -173,15 +173,65 @@ class AppStoreConnectService:
                 },
             }
         }
-        response = self._request("POST", "/v1/analyticsReportRequests", json_body=payload)
-        request_id = (((response or {}).get("data") or {}).get("id") or "").strip()
-        if not request_id:
-            raise ASCAPIError("App Store Connect did not return a report request id.")
-        return request_id
+        try:
+            response = self._request("POST", "/v1/analyticsReportRequests", json_body=payload)
+            request_id = (((response or {}).get("data") or {}).get("id") or "").strip()
+            if not request_id:
+                raise ASCAPIError("App Store Connect did not return a report request id.")
+            return request_id
+        except ASCAPIError as exc:
+            message = str(exc)
+            if "status=409" not in message:
+                raise
+            existing_id = self.find_existing_report_request_id(
+                asc_app_id,
+                preferred_access_type="ONGOING",
+            )
+            if existing_id:
+                logger.warning(
+                    "ASC report request already exists for app %s; reusing request %s.",
+                    asc_app_id,
+                    existing_id,
+                )
+                return existing_id
+            raise
 
     def list_reports_for_request(self, request_id: str) -> list[dict[str, Any]]:
         response = self._request("GET", f"/v1/analyticsReportRequests/{request_id}/reports")
         return list((response or {}).get("data") or [])
+
+    def list_report_requests_for_app(self, asc_app_id: str) -> list[dict[str, Any]]:
+        response = self._request(
+            "GET",
+            f"/v1/apps/{asc_app_id}/analyticsReportRequests",
+            params={
+                "limit": 200,
+                "fields[analyticsReportRequests]": "accessType",
+            },
+        )
+        return list((response or {}).get("data") or [])
+
+    def find_existing_report_request_id(self, asc_app_id: str, *, preferred_access_type: str = "ONGOING") -> str:
+        requests_data = self.list_report_requests_for_app(asc_app_id)
+        preferred = []
+        fallback = []
+        for row in requests_data:
+            if not isinstance(row, dict):
+                continue
+            request_id = str(row.get("id") or "").strip()
+            if not request_id:
+                continue
+            attrs = row.get("attributes") if isinstance(row.get("attributes"), dict) else {}
+            access_type = str((attrs or {}).get("accessType") or "").strip().upper()
+            if access_type == preferred_access_type.upper():
+                preferred.append(request_id)
+            else:
+                fallback.append(request_id)
+        if preferred:
+            return preferred[0]
+        if fallback:
+            return fallback[0]
+        return ""
 
     def list_report_instances(self, report_id: str) -> list[dict[str, Any]]:
         response = self._request("GET", f"/v1/analyticsReports/{report_id}/instances")

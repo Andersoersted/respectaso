@@ -199,9 +199,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const ascLatestDate = document.getElementById('asc-latest-date');
     const COPILOT_STAGE_LABELS = {
         queued: 'Queued',
+        syncing_asc: 'Syncing ASC',
+        asc_sync_failed: 'ASC sync failed (continuing)',
         preparing: 'Preparing run',
         collecting_signals: 'Collecting keyword signals',
         generating_recommendations: 'Generating AI recommendations',
+        model_output_received: 'Model output received',
         scoring_recommendations: 'Scoring recommendations',
         persisting_output: 'Saving output',
         complete: 'Complete',
@@ -213,6 +216,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let progressPollStartedAtMs = 0;
     let progressValue = 0;
     let progressLastRun = null;
+    let progressCompletionHandledForRunId = null;
 
     function fmtPct(value) {
         return `${Math.round((Number(value || 0)) * 100)}%`;
@@ -263,11 +267,33 @@ document.addEventListener('DOMContentLoaded', () => {
         return COPILOT_STAGE_LABELS[key] || key.replace(/_/g, ' ').replace(/\b\w/g, (m) => m.toUpperCase()) || 'Running';
     }
 
+    function isRunTerminal(run) {
+        if (!run || !run.status) return false;
+        return String(run.status).toLowerCase() !== 'running';
+    }
+
     function stopProgressPolling() {
         if (progressPollInterval) {
             clearInterval(progressPollInterval);
             progressPollInterval = null;
         }
+    }
+
+    function beginProgressPolling(appId, run) {
+        stopProgressPolling();
+        progressPollInFlight = false;
+        progressPollRunId = run?.id || null;
+        progressLastRun = run || null;
+        progressPollStartedAtMs = run?.started_at ? Date.parse(run.started_at) : Date.now();
+        progressCompletionHandledForRunId = null;
+        const initialPercent = Number(run?.progress_percent || 2);
+        setProgress(
+            initialPercent,
+            stageLabel(run?.progress_stage || 'preparing'),
+            run?.progress_detail || 'Waiting for server progress updates.'
+        );
+        pollCopilotProgress(appId);
+        progressPollInterval = setInterval(() => pollCopilotProgress(appId), 1200);
     }
 
     async function pollCopilotProgress(appId) {
@@ -295,8 +321,27 @@ document.addEventListener('DOMContentLoaded', () => {
                 run.progress_detail || 'Copilot run in progress.'
             );
 
-            if (run.status && run.status !== 'running') {
+            if (isRunTerminal(run)) {
                 stopProgressPolling();
+                if (progressCompletionHandledForRunId !== run.id) {
+                    progressCompletionHandledForRunId = run.id;
+                    await loadCopilotData();
+                    if (String(run.status).toLowerCase() === 'success') {
+                        finishCopilotProgress({
+                            ok: true,
+                            run,
+                            detail: run.progress_detail || 'Copilot run finished.',
+                        });
+                        setStatus('Copilot run completed successfully.', 'success');
+                    } else {
+                        finishCopilotProgress({
+                            ok: false,
+                            run,
+                            detail: run.error || run.progress_detail || 'Copilot run failed.',
+                        });
+                        setStatus(run.error || run.progress_detail || 'Copilot run failed.', 'error');
+                    }
+                }
             }
         } catch (_err) {
             // Keep polling silently; final request error/success is shown by runCopilot.
@@ -306,15 +351,15 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function startCopilotProgress(appId) {
-        stopProgressPolling();
-        progressPollInFlight = false;
-        progressPollRunId = null;
-        progressLastRun = null;
-        progressPollStartedAtMs = Date.now();
         progressValue = 0;
-        setProgress(2, 'Preparing run', 'Waiting for server to start the Copilot run.');
-        pollCopilotProgress(appId);
-        progressPollInterval = setInterval(() => pollCopilotProgress(appId), 1200);
+        beginProgressPolling(appId, {
+            id: null,
+            status: 'running',
+            progress_percent: 2,
+            progress_stage: 'preparing',
+            progress_detail: 'Waiting for server to start the Copilot run.',
+            started_at: new Date().toISOString(),
+        });
     }
 
     function finishCopilotProgress({ok, detail, run}) {
@@ -454,6 +499,10 @@ document.addEventListener('DOMContentLoaded', () => {
         generateBtn.disabled = !appId;
         syncBtn.disabled = !appId;
         if (!appId) {
+            stopProgressPolling();
+            progressPollRunId = null;
+            progressLastRun = null;
+            progressEl.classList.add('hidden');
             renderRecommendations([]);
             renderMetadataVariants([]);
             renderRuns([]);
@@ -468,6 +517,14 @@ document.addEventListener('DOMContentLoaded', () => {
             renderMetadataVariants(data.metadata_variants || []);
             renderRuns(data.runs || []);
             renderASCStatus(data.asc_status || null);
+            const latestRun = (data.runs && data.runs.length) ? data.runs[0] : null;
+            const hasRunningRun = latestRun && String(latestRun.status).toLowerCase() === 'running';
+            generateBtn.disabled = !appId || Boolean(hasRunningRun);
+            syncBtn.disabled = !appId || Boolean(hasRunningRun);
+            if (hasRunningRun) {
+                beginProgressPolling(appId, latestRun);
+                setStatus(`Resumed Copilot run #${latestRun.id}.`, 'info');
+            }
             setStatus(`Loaded copilot data for ${data.app?.name || 'app'}.`, 'info');
         } catch (err) {
             setStatus(err.message || 'Failed to load copilot data.', 'error');
@@ -480,7 +537,7 @@ document.addEventListener('DOMContentLoaded', () => {
         generateBtn.disabled = true;
         syncBtn.disabled = true;
         startCopilotProgress(appId);
-        setStatus('Running AI Copilot. This may take a while.', 'info');
+        setStatus('Starting AI Copilot background run.', 'info');
         try {
             const resp = await fetch('{% url "aso:ai_copilot_generate" %}', {
                 method: 'POST',
@@ -493,16 +550,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 }),
             });
             const data = await readJsonResponse(resp, 'Copilot run');
+            if (resp.status === 409 && data.run) {
+                beginProgressPolling(appId, data.run);
+                setStatus(data.error || `Copilot run #${data.run.id} is already running.`, 'info');
+                await loadCopilotData();
+                return;
+            }
             if (!resp.ok) throw new Error(data.error || 'Copilot generation failed.');
-            renderRecommendations(data.recommendations || []);
-            renderMetadataVariants(data.metadata_variants || []);
+            if (data.run) {
+                beginProgressPolling(appId, data.run);
+                setStatus(`Copilot run #${data.run.id} started. You can navigate away and return later.`, 'info');
+            }
             await loadCopilotData();
-            finishCopilotProgress({
-                ok: true,
-                run: data.run || null,
-                detail: `Generated ${data.recommendations?.length || 0} recommendations and ${data.metadata_variants?.length || 0} metadata variants.`,
-            });
-            setStatus(`Copilot generated ${data.recommendations?.length || 0} recommendations.`, 'success');
         } catch (err) {
             finishCopilotProgress({
                 ok: false,
@@ -511,8 +570,9 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             setStatus(err.message || 'Copilot generation failed.', 'error');
         } finally {
-            generateBtn.disabled = !appSelect.value;
-            syncBtn.disabled = !appSelect.value;
+            const isRunning = progressLastRun && String(progressLastRun.status).toLowerCase() === 'running';
+            generateBtn.disabled = !appSelect.value || Boolean(isRunning);
+            syncBtn.disabled = !appSelect.value || Boolean(isRunning);
         }
     }
 

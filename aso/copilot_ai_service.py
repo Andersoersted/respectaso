@@ -5,6 +5,7 @@ AI Copilot generation + action handlers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import json
 import logging
 import re
@@ -37,6 +38,10 @@ WORD_RE = re.compile(r"[a-z0-9]+")
 
 class AICopilotError(Exception):
     """Raised when AI Copilot cannot complete safely."""
+
+    def __init__(self, message: str, *, user_error: bool = True):
+        super().__init__(message)
+        self.user_error = bool(user_error)
 
 
 class RecommendationOut(BaseModel):
@@ -81,6 +86,35 @@ def _build_openai_client(api_key: str):
         timeout=settings.OPENAI_TIMEOUT_SECONDS,
         max_retries=settings.OPENAI_MAX_RETRIES,
     )
+
+
+@lru_cache(maxsize=1)
+def _openai_exception_types() -> dict[str, type[BaseException]]:
+    try:
+        import openai
+    except Exception:  # pragma: no cover - import guard
+        return {}
+
+    names = (
+        "APIConnectionError",
+        "APITimeoutError",
+        "APIStatusError",
+        "RateLimitError",
+        "AuthenticationError",
+        "PermissionDeniedError",
+        "BadRequestError",
+        "NotFoundError",
+    )
+    return {name: cls for name in names if isinstance((cls := getattr(openai, name, None)), type)}
+
+
+def _is_openai_exc(exc: Exception, *names: str) -> bool:
+    type_map = _openai_exception_types()
+    for name in names:
+        exc_type = type_map.get(name)
+        if exc_type and isinstance(exc, exc_type):
+            return True
+    return False
 
 
 def _clean_keyword(value: str) -> str:
@@ -137,14 +171,127 @@ def _extract_responses_parse(output: Any) -> CopilotOutput | None:
     return None
 
 
-def _format_openai_exception(exc: Exception) -> str:
+def _openai_error_meta(exc: Exception) -> dict[str, Any]:
+    status_code = getattr(exc, "status_code", None)
+    request_id = getattr(exc, "request_id", None)
+    body_excerpt = ""
+    response = getattr(exc, "response", None)
+    response_text = getattr(response, "text", None) if response is not None else None
+    if response_text:
+        body_excerpt = str(response_text).replace("\n", " ").strip()[:320]
+    if not body_excerpt:
+        body_obj = getattr(exc, "body", None)
+        if body_obj:
+            if isinstance(body_obj, (dict, list)):
+                body_excerpt = json.dumps(body_obj, ensure_ascii=True)[:320]
+            else:
+                body_excerpt = str(body_obj).replace("\n", " ").strip()[:320]
+    return {
+        "exception_type": exc.__class__.__name__,
+        "status_code": status_code,
+        "request_id": request_id,
+        "body_excerpt": body_excerpt,
+    }
+
+
+def _format_openai_exception(exc: Exception) -> tuple[str, bool]:
     msg = str(exc or "").strip() or exc.__class__.__name__
-    if "timed out" in msg.lower():
+    meta = _openai_error_meta(exc)
+    status_code = meta.get("status_code")
+    request_id = meta.get("request_id")
+    body_excerpt = str(meta.get("body_excerpt") or "")
+    text = f"{msg} {body_excerpt}".lower()
+    request_hint = f" (request_id={request_id})" if request_id else ""
+
+    if _is_openai_exc(exc, "APITimeoutError"):
         return (
             "OpenAI request timed out. Retry, or increase OPENAI timeout in Config "
-            "(OPENAI_TIMEOUT_SECONDS)."
+            f"(OPENAI_TIMEOUT_SECONDS).{request_hint}",
+            False,
         )
-    return msg
+    if _is_openai_exc(exc, "APIConnectionError"):
+        return (
+            "OpenAI connection failed. Check network egress and retry."
+            f"{request_hint}",
+            False,
+        )
+    if _is_openai_exc(exc, "RateLimitError") or status_code == 429 or "insufficient_quota" in text or "quota" in text:
+        return (
+            "OpenAI quota or rate limit was hit. Check OpenAI billing/usage and retry."
+            f"{request_hint}",
+            True,
+        )
+    if _is_openai_exc(exc, "AuthenticationError") or status_code == 401:
+        return (
+            "OpenAI authentication failed. Verify OPENAI_API_KEY in Config."
+            f"{request_hint}",
+            True,
+        )
+    if _is_openai_exc(exc, "PermissionDeniedError") or status_code == 403:
+        return (
+            "OpenAI request was forbidden for this key/model. Check project permissions."
+            f"{request_hint}",
+            True,
+        )
+    if _is_openai_exc(exc, "BadRequestError") or status_code == 400:
+        return (
+            f"OpenAI rejected the request payload: {msg}{request_hint}",
+            True,
+        )
+    if status_code and int(status_code) >= 500:
+        return (
+            "OpenAI service is temporarily unavailable. Please retry."
+            f"{request_hint}",
+            False,
+        )
+    if "timed out" in text or "timeout" in text:
+        return (
+            "OpenAI request timed out. Retry, or increase OPENAI timeout in Config "
+            f"(OPENAI_TIMEOUT_SECONDS).{request_hint}",
+            False,
+        )
+    return (f"OpenAI error: {msg}{request_hint}", True)
+
+
+def _should_fallback_after_responses_error(exc: Exception, *, meta: dict[str, Any]) -> bool:
+    """Only fallback when responses.parse appears unsupported for this route/model."""
+    status_code = meta.get("status_code")
+    text = f"{exc} {meta.get('body_excerpt') or ''}".lower()
+
+    if _is_openai_exc(
+        exc,
+        "APITimeoutError",
+        "APIConnectionError",
+        "RateLimitError",
+        "AuthenticationError",
+        "PermissionDeniedError",
+    ):
+        return False
+    if status_code in {401, 403, 429}:
+        return False
+    if status_code and int(status_code) >= 500:
+        return False
+    if "timed out" in text or "timeout" in text:
+        return False
+
+    parse_unsupported_markers = (
+        "text_format",
+        "response_format",
+        "path_error",
+        "not a valid url",
+        "unsupported",
+        "unknown parameter",
+        "unrecognized",
+    )
+    has_parse_marker = any(marker in text for marker in parse_unsupported_markers)
+
+    if _is_openai_exc(exc, "NotFoundError"):
+        return True
+    if _is_openai_exc(exc, "BadRequestError") and has_parse_marker:
+        return True
+    if status_code in {400, 404, 405, 422} and has_parse_marker:
+        return True
+    return False
 
 
 def _generate_with_openai(
@@ -154,20 +301,26 @@ def _generate_with_openai(
     run_id: int | None = None,
 ) -> CopilotOutput:
     client = _build_openai_client(settings_obj.api_key)
+    request_client = client.with_options(
+        timeout=settings.OPENAI_TIMEOUT_SECONDS,
+        max_retries=settings.OPENAI_MAX_RETRIES,
+    )
     user_prompt = _render_prompt(settings_obj.user_prompt_template, snapshot)
     model = settings_obj.model
 
     logger.warning(
-        "Copilot run %s starting responses.parse model=%s timeout=%ss retries=%s snapshot_rows=%s",
+        "Copilot run %s sending payload to OpenAI responses.parse model=%s timeout=%ss retries=%s snapshot_rows=%s existing_keywords=%s prompt_chars=%s",
         run_id or "-",
         model,
         settings.OPENAI_TIMEOUT_SECONDS,
         settings.OPENAI_MAX_RETRIES,
         len(snapshot.get("feature_rows") or []),
+        len(snapshot.get("existing_keywords") or []),
+        len(user_prompt),
     )
     responses_started = time.perf_counter()
     try:
-        response = client.responses.parse(
+        response = request_client.responses.parse(
             model=model,
             input=[
                 {"role": "system", "content": settings_obj.system_prompt},
@@ -177,10 +330,12 @@ def _generate_with_openai(
         )
         parsed = _extract_responses_parse(response)
         if parsed is not None:
+            req_id = getattr(response, "_request_id", None)
             logger.warning(
-                "Copilot run %s responses.parse succeeded in %.2fs",
+                "Copilot run %s responses.parse succeeded in %.2fs request_id=%s",
                 run_id or "-",
                 time.perf_counter() - responses_started,
+                req_id or "-",
             )
             return parsed
         logger.warning(
@@ -189,13 +344,21 @@ def _generate_with_openai(
             time.perf_counter() - responses_started,
         )
     except Exception as exc:
+        meta = _openai_error_meta(exc)
         logger.warning(
-            "Copilot run %s responses.parse failed for model %s in %.2fs: %s",
+            "Copilot run %s responses.parse failed for model %s in %.2fs type=%s status=%s request_id=%s detail=%s body=%s",
             run_id or "-",
             model,
             time.perf_counter() - responses_started,
+            meta.get("exception_type"),
+            meta.get("status_code"),
+            meta.get("request_id") or "-",
             exc,
+            meta.get("body_excerpt") or "-",
         )
+        if not _should_fallback_after_responses_error(exc, meta=meta):
+            formatted, user_error = _format_openai_exception(exc)
+            raise AICopilotError(f"Copilot generation failed: {formatted}", user_error=user_error) from exc
 
     # Fallback for models/routes without responses structured parsing.
     logger.warning(
@@ -205,7 +368,7 @@ def _generate_with_openai(
     )
     fallback_started = time.perf_counter()
     try:
-        completion = client.chat.completions.parse(
+        completion = request_client.chat.completions.parse(
             model=model,
             messages=[
                 {"role": "system", "content": settings_obj.system_prompt},
@@ -214,24 +377,32 @@ def _generate_with_openai(
             response_format=CopilotOutput,
         )
     except Exception as exc:  # pragma: no cover - runtime fallback path
+        meta = _openai_error_meta(exc)
         logger.error(
-            "Copilot run %s chat.completions.parse failed for model %s in %.2fs: %s",
+            "Copilot run %s chat.completions.parse failed for model %s in %.2fs type=%s status=%s request_id=%s detail=%s body=%s",
             run_id or "-",
             model,
             time.perf_counter() - fallback_started,
+            meta.get("exception_type"),
+            meta.get("status_code"),
+            meta.get("request_id") or "-",
             exc,
+            meta.get("body_excerpt") or "-",
         )
-        raise AICopilotError(f"Copilot generation failed: {_format_openai_exception(exc)}") from exc
+        formatted, user_error = _format_openai_exception(exc)
+        raise AICopilotError(f"Copilot generation failed: {formatted}", user_error=user_error) from exc
 
     message = completion.choices[0].message if completion.choices else None
     parsed = getattr(message, "parsed", None) if message else None
     if not isinstance(parsed, CopilotOutput):
         refusal = getattr(message, "refusal", "") if message else ""
-        raise AICopilotError(refusal or "Copilot model returned no structured output.")
+        raise AICopilotError(refusal or "Copilot model returned no structured output.", user_error=True)
+    req_id = getattr(completion, "_request_id", None)
     logger.warning(
-        "Copilot run %s chat.completions.parse fallback succeeded in %.2fs",
+        "Copilot run %s chat.completions.parse fallback succeeded in %.2fs request_id=%s",
         run_id or "-",
         time.perf_counter() - fallback_started,
+        req_id or "-",
     )
     return parsed
 
@@ -309,19 +480,35 @@ def generate_ai_copilot(
     *,
     country: str,
     settings_obj: CopilotSettings,
+    run: AICopilotRun | None = None,
 ) -> AICopilotRun:
     country = (country or "us").lower()
-    run = AICopilotRun.objects.create(
-        app=app,
-        status=AICopilotRun.STATUS_RUNNING,
-        progress_percent=2,
-        progress_stage="preparing",
-        progress_detail="Validating inputs and preparing run.",
-        model=settings_obj.model,
-        country=country,
-        input_snapshot_json={},
-        feature_summary_json={},
-    )
+    if run is None:
+        run = AICopilotRun.objects.create(
+            app=app,
+            status=AICopilotRun.STATUS_RUNNING,
+            progress_percent=2,
+            progress_stage="preparing",
+            progress_detail="Validating inputs and preparing run.",
+            model=settings_obj.model,
+            country=country,
+            input_snapshot_json={},
+            feature_summary_json={},
+        )
+    else:
+        _update_run_fields(
+            run,
+            status=AICopilotRun.STATUS_RUNNING,
+            progress_percent=2,
+            progress_stage="preparing",
+            progress_detail="Validating inputs and preparing run.",
+            model=settings_obj.model,
+            country=country,
+            input_snapshot_json={},
+            feature_summary_json={},
+            finished_at=None,
+            error="",
+        )
 
     try:
         _set_run_progress(
@@ -345,9 +532,29 @@ def generate_ai_copilot(
             run,
             percent=34,
             stage="generating_recommendations",
-            detail="Requesting structured recommendations from the model.",
+            detail=(
+                f"Sending snapshot to {settings_obj.model} "
+                f"({len(snapshot.get('feature_rows') or [])} feature row(s), "
+                f"{len(snapshot.get('existing_keywords') or [])} existing keyword(s))."
+            ),
         )
         output = _generate_with_openai(snapshot=snapshot, settings_obj=settings_obj, run_id=run.id)
+
+        logger.warning(
+            "Copilot run %s received model output recommendations=%s metadata_variants=%s",
+            run.id,
+            len(output.recommendations),
+            len(output.metadata_variants),
+        )
+        _set_run_progress(
+            run,
+            percent=46,
+            stage="model_output_received",
+            detail=(
+                f"Received model output: {len(output.recommendations)} recommendation candidate(s), "
+                f"{len(output.metadata_variants)} metadata variant candidate(s)."
+            ),
+        )
 
         _set_run_progress(
             run,
@@ -477,7 +684,10 @@ def generate_ai_copilot(
                 error="",
                 progress_percent=100,
                 progress_stage="complete",
-                progress_detail="Copilot run completed successfully.",
+                progress_detail=(
+                    f"Saved {min(len(rec_objects), 30)} recommendation(s) and "
+                    f"{min(len(variant_objects), 3)} metadata variant(s)."
+                ),
             )
         return run
     except AICopilotError as exc:
@@ -487,7 +697,7 @@ def generate_ai_copilot(
     except Exception as exc:
         _mark_run_failed(run, str(exc))
         logger.exception("AI copilot run %s failed unexpectedly for app %s", run.id, app.id)
-        raise AICopilotError(str(exc)) from exc
+        raise AICopilotError(str(exc), user_error=False) from exc
 
 
 @transaction.atomic

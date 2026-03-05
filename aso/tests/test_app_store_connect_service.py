@@ -3,7 +3,7 @@ from __future__ import annotations
 from unittest import TestCase
 from unittest.mock import patch
 
-from aso.app_store_connect_service import AppStoreConnectService
+from aso.app_store_connect_service import ASCAPIError, AppStoreConnectService
 
 
 class AppStoreConnectServicePathTests(TestCase):
@@ -80,3 +80,38 @@ class AppStoreConnectServicePathTests(TestCase):
         self.assertEqual(rows, [])
         mock_get_segment.assert_called_once_with("seg-1")
         mock_download.assert_called_once_with("https://download/seg-1")
+
+    def test_create_report_request_reuses_existing_ongoing_request_on_conflict(self):
+        conflict = ASCAPIError("App Store Connect request failed ... (status=409, body=STATE_ERROR)")
+        with (
+            patch.object(
+                self.service,
+                "_request",
+                side_effect=[
+                    conflict,
+                    {
+                        "data": [
+                            {"id": "req-old", "attributes": {"accessType": "ONGOING"}},
+                            {"id": "req-snapshot", "attributes": {"accessType": "ONE_TIME_SNAPSHOT"}},
+                        ]
+                    },
+                ],
+            ) as mock_request,
+        ):
+            request_id = self.service.create_report_request("123456")
+
+        self.assertEqual(request_id, "req-old")
+        self.assertEqual(mock_request.call_count, 2)
+        self.assertEqual(mock_request.call_args_list[1].args[1], "/v1/apps/123456/analyticsReportRequests")
+
+    def test_create_report_request_conflict_without_existing_requests_raises(self):
+        conflict = ASCAPIError("App Store Connect request failed ... (status=409, body=STATE_ERROR)")
+        with (
+            patch.object(
+                self.service,
+                "_request",
+                side_effect=[conflict, {"data": []}],
+            ),
+            self.assertRaises(ASCAPIError),
+        ):
+            self.service.create_report_request("123456")
