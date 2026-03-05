@@ -161,3 +161,15 @@
     </div>
 </div>
 {% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    // Clear toggles are one-shot actions; avoid browser restoring stale checked state.
+    ['id_clear_openai_api_key', 'id_clear_asc_private_key'].forEach(function(id) {
+        const el = document.getElementById(id);
+        if (el) el.checked = false;
+    });
+});
+</script>
+{% endblock %}

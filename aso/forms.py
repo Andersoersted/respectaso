@@ -308,12 +308,12 @@ class RuntimeConfigForm(forms.Form):
         self.fields["asc_default_days_back"].initial = config.asc_default_days_back or settings.ASC_DEFAULT_DAYS_BACK
 
     def save(self):
-        if self.cleaned_data.get("clear_openai_api_key"):
+        incoming_key = (self.cleaned_data.get("openai_api_key") or "").strip()
+        if incoming_key:
+            # Typed key should always win over a stale/checked clear box.
+            self.config.openai_api_key = incoming_key
+        elif self.cleaned_data.get("clear_openai_api_key"):
             self.config.openai_api_key = ""
-        else:
-            incoming_key = (self.cleaned_data.get("openai_api_key") or "").strip()
-            if incoming_key:
-                self.config.openai_api_key = incoming_key
 
         self.config.openai_default_model = (
             self.cleaned_data.get("openai_default_model") or ""
@@ -330,12 +330,12 @@ class RuntimeConfigForm(forms.Form):
         ).strip()
         self.config.asc_issuer_id = (self.cleaned_data.get("asc_issuer_id") or "").strip()
         self.config.asc_key_id = (self.cleaned_data.get("asc_key_id") or "").strip()
-        if self.cleaned_data.get("clear_asc_private_key"):
+        incoming_private_key = (self.cleaned_data.get("asc_private_key_pem") or "").strip()
+        if incoming_private_key:
+            # Same precedence rule as OpenAI key above.
+            self.config.asc_private_key_pem = incoming_private_key
+        elif self.cleaned_data.get("clear_asc_private_key"):
             self.config.asc_private_key_pem = ""
-        else:
-            incoming_private_key = (self.cleaned_data.get("asc_private_key_pem") or "").strip()
-            if incoming_private_key:
-                self.config.asc_private_key_pem = incoming_private_key
         self.config.asc_default_days_back = self.cleaned_data.get("asc_default_days_back")
         self.config.save()
         return self.config

@@ -545,6 +545,37 @@ class RuntimeConfigViewTests(TestCase):
         self.assertEqual(cfg.openai_default_model, "gpt-4.1-mini")
         self.assertEqual(cfg.openai_available_models, "gpt-4.1-mini,gpt-4.1")
 
+    def test_config_page_keeps_existing_api_key_when_new_key_blank(self):
+        cfg = RuntimeConfig.get_solo()
+        cfg.openai_api_key = "sk-existing-123"
+        cfg.save()
+
+        response = self.client.post(
+            reverse("aso:config"),
+            data={
+                "openai_api_key": "",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        cfg.refresh_from_db()
+        self.assertEqual(cfg.openai_api_key, "sk-existing-123")
+
+    def test_config_page_prefers_new_api_key_even_when_clear_checked(self):
+        cfg = RuntimeConfig.get_solo()
+        cfg.openai_api_key = "sk-old-123"
+        cfg.save()
+
+        response = self.client.post(
+            reverse("aso:config"),
+            data={
+                "openai_api_key": "sk-new-456",
+                "clear_openai_api_key": "on",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        cfg.refresh_from_db()
+        self.assertEqual(cfg.openai_api_key, "sk-new-456")
+
 
 class DashboardServerSortTests(TestCase):
     def test_popularity_sort_is_global_before_pagination(self):
