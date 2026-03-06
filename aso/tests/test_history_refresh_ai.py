@@ -9,6 +9,7 @@ from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
+from pydantic import BaseModel, ConfigDict
 
 from aso.ai_service import AISuggestionError, accept_ai_suggestion, generate_ai_suggestions
 from aso.copilot_ai_service import (
@@ -18,6 +19,7 @@ from aso.copilot_ai_service import (
     MetadataVariantOut,
     RecommendationOut,
     _generate_with_openai,
+    _strict_json_schema_for_model,
     generate_ai_copilot,
 )
 from aso.models import (
@@ -1081,6 +1083,51 @@ class AICopilotOpenAIRequestTests(TestCase):
         self.assertEqual(dummy.responses.kwargs.get("reasoning", {}).get("effort"), "high")
 
     @patch("aso.copilot_ai_service._build_openai_client")
+    def test_generate_with_openai_prefers_responses_parse_when_available(self, mock_build_client):
+        class DummyResponses:
+            def __init__(self):
+                self.parse_kwargs = None
+                self.create_called = False
+
+            def parse(self, **kwargs):
+                self.parse_kwargs = kwargs
+                return SimpleNamespace(output_parsed=CopilotOutput())
+
+            def create(self, **_kwargs):
+                self.create_called = True
+                raise AssertionError("responses.create should not be called when responses.parse is available")
+
+        class DummyClient:
+            def __init__(self):
+                self.responses = DummyResponses()
+
+            def with_options(self, **_kwargs):
+                return self
+
+        dummy = DummyClient()
+        mock_build_client.return_value = dummy
+
+        _generate_with_openai(
+            snapshot={
+                "feature_rows": [{"keyword": "one"}],
+                "existing_keywords": ["one"],
+            },
+            settings_obj=CopilotSettings(
+                model="gpt-5-mini",
+                api_key="sk-test-123",
+                system_prompt="System",
+                user_prompt_template="{{SNAPSHOT_JSON}}",
+            ),
+            run_id=123,
+            attempt="primary",
+            timeout_seconds=20.0,
+        )
+
+        self.assertIsNotNone(dummy.responses.parse_kwargs)
+        self.assertIs(dummy.responses.parse_kwargs.get("text_format"), CopilotOutput)
+        self.assertFalse(dummy.responses.create_called)
+
+    @patch("aso.copilot_ai_service._build_openai_client")
     def test_generate_with_openai_parses_raw_output_text_without_chat_fallback(self, mock_build_client):
         raw_payload = {
             "recommendations": [
@@ -1150,3 +1197,32 @@ class AICopilotOpenAIRequestTests(TestCase):
         )
 
         self.assertEqual(output.recommendations[0].keyword, "raw keyword")
+
+
+class AICopilotSchemaTests(TestCase):
+    def test_strict_schema_sets_additional_properties_false_on_all_objects(self):
+        schema = _strict_json_schema_for_model(CopilotOutput)
+
+        def _assert_object_nodes(node):
+            if isinstance(node, dict):
+                if node.get("type") == "object":
+                    self.assertIn("additionalProperties", node)
+                    self.assertIs(node["additionalProperties"], False)
+                for value in node.values():
+                    _assert_object_nodes(value)
+            elif isinstance(node, list):
+                for item in node:
+                    _assert_object_nodes(item)
+
+        _assert_object_nodes(schema)
+
+    def test_strict_schema_overrides_explicit_additional_properties_true(self):
+        class Child(BaseModel):
+            x: int
+
+        class AllowExtrasModel(BaseModel):
+            model_config = ConfigDict(extra="allow")
+            child: Child
+
+        schema = _strict_json_schema_for_model(AllowExtrasModel)
+        self.assertIs(schema.get("additionalProperties"), False)

@@ -247,6 +247,44 @@ def _compact_snapshot(snapshot: dict[str, Any], *, feature_rows_limit: int, exis
     return compact
 
 
+def _enforce_no_additional_properties(schema: Any) -> Any:
+    if isinstance(schema, dict):
+        is_object_schema = schema.get("type") == "object" or "properties" in schema
+        if is_object_schema:
+            schema["additionalProperties"] = False
+        for key, value in list(schema.items()):
+            schema[key] = _enforce_no_additional_properties(value)
+        return schema
+    if isinstance(schema, list):
+        return [_enforce_no_additional_properties(item) for item in schema]
+    return schema
+
+
+@lru_cache(maxsize=1)
+def _openai_strict_schema_builder():
+    try:
+        from openai.lib._pydantic import to_strict_json_schema
+    except Exception:  # pragma: no cover - optional SDK helper
+        return None
+    return to_strict_json_schema
+
+
+def _strict_json_schema_for_model(model_cls: type[BaseModel]) -> dict[str, Any]:
+    strict_builder = _openai_strict_schema_builder()
+    if strict_builder:
+        try:
+            schema = strict_builder(model_cls)
+            return _enforce_no_additional_properties(schema)
+        except Exception:
+            logger.warning(
+                "OpenAI strict schema helper failed for %s; falling back to local enforcement.",
+                getattr(model_cls, "__name__", "model"),
+                exc_info=True,
+            )
+    schema = model_cls.model_json_schema()
+    return _enforce_no_additional_properties(schema)
+
+
 def _append_run_event(
     run: AICopilotRun | None,
     *,
@@ -731,28 +769,37 @@ def _generate_with_openai(
     }
     payload_summary_json = json.dumps(payload_summary, ensure_ascii=True)
 
-    responses_create_kwargs: dict[str, Any] = {
+    response_input = [
+        {"role": "system", "content": settings_obj.system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    responses_parse_callable = getattr(request_client.responses, "parse", None)
+    use_responses_parse = callable(responses_parse_callable)
+    responses_route = "responses.parse" if use_responses_parse else "responses.create"
+    responses_call = responses_parse_callable if use_responses_parse else request_client.responses.create
+    responses_kwargs: dict[str, Any] = {
         "model": model,
-        "input": [
-            {"role": "system", "content": settings_obj.system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "text": {
+        "input": response_input,
+        "max_output_tokens": OPENAI_COPILOT_MAX_OUTPUT_TOKENS,
+    }
+    if use_responses_parse:
+        responses_kwargs["text_format"] = CopilotOutput
+    else:
+        responses_kwargs["text"] = {
             "format": {
                 "type": "json_schema",
                 "name": "copilot_output",
                 "strict": True,
-                "schema": CopilotOutput.model_json_schema(),
+                "schema": _strict_json_schema_for_model(CopilotOutput),
             }
-        },
-        "max_output_tokens": OPENAI_COPILOT_MAX_OUTPUT_TOKENS,
-    }
+        }
     if reasoning_effort:
-        responses_create_kwargs["reasoning"] = {"effort": reasoning_effort}
+        responses_kwargs["reasoning"] = {"effort": reasoning_effort}
 
     logger.warning(
-        "Copilot run %s sending payload to OpenAI responses.create summary=%s",
+        "Copilot run %s sending payload to OpenAI %s summary=%s",
         effective_run_id or "-",
+        responses_route,
         payload_summary_json,
     )
     _append_run_event(
@@ -761,8 +808,9 @@ def _generate_with_openai(
         message=f"OpenAI request summary: {payload_summary_json}",
     )
     logger.warning(
-        "Copilot run %s sending payload to OpenAI responses.create attempt=%s model=%s reasoning=%s timeout=%ss retries=%s snapshot_rows=%s existing_keywords=%s prompt_chars=%s",
+        "Copilot run %s sending payload to OpenAI %s attempt=%s model=%s reasoning=%s timeout=%ss retries=%s snapshot_rows=%s existing_keywords=%s prompt_chars=%s",
         effective_run_id or "-",
+        responses_route,
         attempt,
         model,
         reasoning_effort or "auto",
@@ -774,10 +822,10 @@ def _generate_with_openai(
     )
     responses_started = time.perf_counter()
     try:
-        response = request_client.responses.create(**responses_create_kwargs)
+        response = responses_call(**responses_kwargs)
         return _coerce_copilot_output_from_response(
             response,
-            route="responses.create",
+            route=responses_route,
             attempt=attempt,
             run=run,
             run_id=effective_run_id,
@@ -788,8 +836,9 @@ def _generate_with_openai(
             raise
         meta = _openai_error_meta(exc)
         logger.warning(
-            "Copilot run %s responses.create failed for model %s in %.2fs attempt=%s type=%s status=%s request_id=%s detail=%s body=%s",
+            "Copilot run %s %s failed for model %s in %.2fs attempt=%s type=%s status=%s request_id=%s detail=%s body=%s",
             effective_run_id or "-",
+            responses_route,
             model,
             time.perf_counter() - responses_started,
             attempt,
@@ -804,7 +853,7 @@ def _generate_with_openai(
             stage="generating_recommendations",
             kind="error",
             message=(
-                "responses.create failed "
+                f"{responses_route} failed "
                 f"(type={meta.get('exception_type')}, status={meta.get('status_code')}, "
                 f"request_id={meta.get('request_id') or '-'}): {exc}"
             ),
@@ -815,14 +864,15 @@ def _generate_with_openai(
             if fallback_reasoning_effort == reasoning_effort:
                 fallback_reasoning_effort = ""
             if fallback_reasoning_effort != reasoning_effort:
-                retry_create_kwargs = dict(responses_create_kwargs)
+                retry_kwargs = dict(responses_kwargs)
                 if fallback_reasoning_effort:
-                    retry_create_kwargs["reasoning"] = {"effort": fallback_reasoning_effort}
+                    retry_kwargs["reasoning"] = {"effort": fallback_reasoning_effort}
                 else:
-                    retry_create_kwargs.pop("reasoning", None)
+                    retry_kwargs.pop("reasoning", None)
                 logger.warning(
-                    "Copilot run %s retrying responses.create with fallback reasoning effort=%s (initial=%s)",
+                    "Copilot run %s retrying %s with fallback reasoning effort=%s (initial=%s)",
                     effective_run_id or "-",
+                    responses_route,
                     fallback_reasoning_effort or "auto",
                     reasoning_effort,
                 )
@@ -836,10 +886,10 @@ def _generate_with_openai(
                 )
                 retry_started = time.perf_counter()
                 try:
-                    retry_response = request_client.responses.create(**retry_create_kwargs)
+                    retry_response = responses_call(**retry_kwargs)
                     return _coerce_copilot_output_from_response(
                         retry_response,
-                        route="responses.create",
+                        route=responses_route,
                         attempt=f"{attempt}:reasoning_retry",
                         run=run,
                         run_id=effective_run_id,
@@ -850,8 +900,9 @@ def _generate_with_openai(
                         raise
                     retry_meta = _openai_error_meta(retry_exc)
                     logger.warning(
-                        "Copilot run %s responses.create reasoning fallback failed type=%s status=%s request_id=%s detail=%s body=%s",
+                        "Copilot run %s %s reasoning fallback failed type=%s status=%s request_id=%s detail=%s body=%s",
                         effective_run_id or "-",
+                        responses_route,
                         retry_meta.get("exception_type"),
                         retry_meta.get("status_code"),
                         retry_meta.get("request_id") or "-",
