@@ -14,6 +14,11 @@ media/
 # Environment
 .env
 *.env.local
+.venv/
+.python-version
+
+# Build artifacts
+*.dmg
 
 # IDE
 .vscode/
@@ -27,3 +32,4 @@ data/
 # OS
 .DS_Store
 Thumbs.db
+venv/

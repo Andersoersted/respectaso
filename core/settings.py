@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -6,20 +7,23 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Current version — update on each release
-VERSION = "1.4.0"
+VERSION = "2.13.0"
 
-# Load .env from persistent data volume (auto-generated SECRET_KEY lives there)
+# Native macOS app vs Docker detection
+IS_NATIVE_APP = os.environ.get("RESPECTASO_NATIVE") == "1" or getattr(sys, "frozen", False)
+
+# Data directory: ~/Library/Application Support/RespectASO/ (native) or ./data (Docker)
 DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-env_file = DATA_DIR / ".env"
+# Load .env from project root (dev) or DATA_DIR (production/Docker)
+env_file = BASE_DIR / ".env"
+if not env_file.exists():
+    env_file = DATA_DIR / ".env"
 if env_file.exists():
     load_dotenv(env_file)
 
-SECRET_KEY = os.environ.get(
-    "SECRET_KEY",
-    "django-insecure-dev-key-change-me-in-production",
-)
+SECRET_KEY = os.environ.get("SECRET_KEY", "") or "django-insecure-dev-key-change-me-in-production"
 
 DEBUG = os.environ.get("DEBUG", "True").lower() in ("true", "1", "yes")
 
@@ -158,6 +162,12 @@ CSRF_TRUSTED_ORIGINS = csv_env(
     DEFAULT_CSRF_TRUSTED_ORIGINS,
 )
 
+# Native app: allow common localhost ports for the embedded WebKit window.
+if IS_NATIVE_APP:
+    for p in range(8000, 8100):
+        CSRF_TRUSTED_ORIGINS.append(f"http://127.0.0.1:{p}")
+        CSRF_TRUSTED_ORIGINS.append(f"http://localhost:{p}")
+
 RESULT_RETENTION_DAYS = int_env("RESULT_RETENTION_DAYS", 365, min_value=30, max_value=3650)
 AUTO_REFRESH_MODE = os.environ.get("AUTO_REFRESH_MODE", "external").strip().lower()
 if AUTO_REFRESH_MODE not in {"external", "thread"}:
@@ -221,3 +231,33 @@ AI_USER_PROMPT_TEMPLATE = (
     os.environ.get("AI_USER_PROMPT_TEMPLATE", DEFAULT_AI_USER_PROMPT_TEMPLATE).strip()
     or DEFAULT_AI_USER_PROMPT_TEMPLATE
 )
+
+# Logging — write to a file in the data directory for the native app
+if IS_NATIVE_APP:
+    _log_file = DATA_DIR / "respectaso.log"
+    LOGGING = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "simple": {
+                "format": "%(asctime)s %(levelname)s %(name)s: %(message)s",
+                "datefmt": "%Y-%m-%d %H:%M:%S",
+            },
+        },
+        "handlers": {
+            "file": {
+                "level": "WARNING",
+                "class": "logging.handlers.RotatingFileHandler",
+                "filename": str(_log_file),
+                "maxBytes": 1_048_576,  # 1 MB
+                "backupCount": 1,
+                "formatter": "simple",
+            },
+        },
+        "loggers": {
+            "aso": {
+                "handlers": ["file"],
+                "level": "WARNING",
+            },
+        },
+    }

@@ -96,7 +96,7 @@ def refresh_pair(
         )
 
     popularity = popularity_est.estimate(competitors, keyword_obj.keyword)
-    breakdown["download_estimates"] = download_est.estimate(popularity or 0, len(competitors))
+    breakdown["download_estimates"] = download_est.estimate(popularity or 0, country=country)
 
     return SearchResult.create_snapshot(
         keyword=keyword_obj,

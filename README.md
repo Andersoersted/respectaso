@@ -1,12 +1,16 @@
 # RespectASO
 
+<p align="center">
+  <img src="desktop/assets/RespectASO.iconset/icon_256x256.png" alt="RespectASO" width="128">
+</p>
+
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?logo=docker&logoColor=white)](docker-compose.yml)
+[![macOS](https://img.shields.io/badge/macOS-Download_.dmg-purple?logo=apple&logoColor=white)](https://github.com/respectlytics/respectaso/releases/latest)
 [![Version](https://img.shields.io/github/v/release/respectlytics/respectaso?color=purple&label=version)](https://github.com/respectlytics/respectaso/releases/latest)
 
-**Free, open-source ASO keyword research tool — self-hosted via Docker. No API keys. No accounts. No data leaves your machine.**
+**Free, open-source ASO keyword research tool for macOS. No API keys. No accounts. No data leaves your machine.**
 
-RespectASO helps iOS developers research App Store keywords privately. Run it locally with a single Docker command and get keyword popularity scores, difficulty analysis, competitor breakdowns, and download estimates — all without sending your research data to third-party services.
+RespectASO helps iOS developers research App Store keywords privately. Download the `.dmg`, drag to Applications, and get keyword popularity scores, difficulty analysis, competitor breakdowns, and download estimates — all without sending your research data to third-party services.
 
 ---
 
@@ -18,14 +22,14 @@ Most ASO tools require paid subscriptions, API keys, and send your keyword resea
 - **Runs entirely on your machine** — all API calls originate from your local network
 - **No telemetry, no analytics, no tracking** — zero data sent to any third party
 - **Free and open-source** — AGPL-3.0 licensed, forever
-- **Single Docker command** — up and running in 30 seconds
+- **Native Mac app** — download the `.dmg`, drag to Applications, done
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| **Keyword Popularity** | Estimated popularity scores (1–100) derived from a 6-signal model analyzing iTunes Search competitor data |
-| **Difficulty Score** | 7 weighted sub-scores (rating volume, dominant players, rating quality, market age, publisher diversity, app count, content relevance) with ranking tier analysis |
+| **Keyword Popularity** | Estimated popularity scores (1–100) based on analysis of iTunes Search API competitor data |
+| **Difficulty Score** | Competition difficulty analysis across multiple factors with ranking tier breakdowns for Top 5, Top 10, and Top 20 |
 | **Ranking Tiers** | Separate difficulty analysis for Top 5, Top 10, and Top 20 positions — because breaking into the top 5 is different from reaching the top 20 |
 | **Download Estimates** | Estimated daily downloads per ranking position based on search volume, tap-through rates, and conversion rates |
 | **Competitor Analysis** | See the top 10 apps ranking for each keyword with ratings, reviews, genre, release date, and direct App Store links |
@@ -38,15 +42,48 @@ Most ASO tools require paid subscriptions, API keys, and send your keyword resea
 | **Daily Auto Refresh (Cron)** | Refresh all tracked keyword-country pairs once per day via management command (recommended for Dokploy cron) |
 | **AI Copilot (Apple-only)** | On-demand keyword recommendations + metadata variants using OpenAI, tracked history, and optional App Store Connect analytics |
 | **CSV Export** | Export your keyword research data for use in spreadsheets |
-| **ASO Targeting Advice** | Automatic keyword classification (Sweet Spot, Hidden Gem, Low Volume, Avoid, etc.) based on popularity vs. difficulty |
+| **ASO Targeting Advice** | Automatic keyword classification (Sweet Spot, Good Target, Hidden Gem, High Competition, Moderate, Low Volume, Avoid) based on opportunity scoring |
 
 ## Quick Start
 
-### Prerequisites
+### 1. Download
+
+**→ [Download RespectASO.dmg](https://github.com/respectlytics/respectaso/releases/latest)** (macOS 12+, Apple Silicon)
+
+### 2. Install
+
+Open the `.dmg` and drag **RespectASO** into your **Applications** folder.
+
+### 3. Launch
+
+Open RespectASO from Applications (or Spotlight: ⌘ Space → "RespectASO"). The app window opens automatically — type a keyword, select a country, and click Search.
+
+> **First launch:** If macOS shows a security dialog, right-click the app → Open → Open. This is only needed once — the app is code-signed and notarized by Apple.
+
+### Updating
+
+When an update is available, a banner appears on the Dashboard with release notes and a **Download Update** button. Download the new `.dmg`, drag to Applications (replace the old version), and relaunch. Your data is preserved — it lives in `~/Library/Application Support/RespectASO/`, separate from the app bundle.
+
+### Data Location
+
+Your keywords, search history, and settings are stored at:
+
+```
+~/Library/Application Support/RespectASO/
+```
+
+This data survives app updates and deletions. Delete this folder only if you want a completely fresh start.
+
+<details>
+<summary><strong>🐳 Docker (free features only)</strong></summary>
+
+Docker provides the **free edition** of RespectASO (keyword research, difficulty scoring, ranking tracking). AI-powered Pro features require the native macOS app above.
+
+#### Prerequisites
 
 - [Docker](https://docs.docker.com/get-docker/) installed and running
 
-### 1. Clone and run
+#### Install via Docker
 
 ```bash
 git clone https://github.com/respectlytics/respectaso.git
@@ -54,9 +91,7 @@ cd respectaso
 docker compose up -d
 ```
 
-### 2. Open in your browser
-
-**→ [http://localhost:8088](http://localhost:8088)**
+Open **[http://localhost:8088](http://localhost:8088)** in your browser.
 
 That's it. The first startup takes a few seconds (database migration + static files).
 
@@ -221,7 +256,7 @@ To back up your data:
 docker cp respectaso-web-1:/app/data ./backup
 ```
 
-### Updating to a New Version
+#### Updating (Docker)
 
 ```bash
 cd respectaso
@@ -231,7 +266,22 @@ docker compose build --no-cache
 docker compose up -d
 ```
 
-Your data is preserved — only the application code is updated.
+#### Migrating from Docker to Native App
+
+Your existing data carries over. Run this one-time migration:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/respectlytics/respectaso/main/desktop/migrate-from-docker.sh | bash
+```
+
+Then install the native app and verify your data is intact. Once confirmed:
+
+```bash
+docker compose down     # Stop the container
+docker compose down -v  # Also remove the volume (only after confirming native app works)
+```
+
+#### Refreshing Dependency Pins
 
 To refresh dependency pins after changing `requirements.in`, run in a Python 3.14 environment:
 
@@ -239,25 +289,61 @@ To refresh dependency pins after changing `requirements.in`, run in a Python 3.1
 pip-compile --upgrade requirements.in
 ```
 
-### Automatic Startup
+</details>
 
-The `docker-compose.yml` includes `restart: unless-stopped`, so the tool automatically restarts when Docker starts. No need to run `docker compose up` again after a reboot.
+## How Scoring Works
+
+RespectASO uses the **iTunes Search API** as its only data source — no Apple Search Ads credentials, no scraping, no paid APIs.
+
+### Popularity Score (1–100)
+
+Estimates how frequently a keyword is searched by analyzing multiple signals from iTunes Search results, including the number and quality of competing apps, keyword relevance patterns, and market depth. Higher scores mean more people are searching for that keyword.
+
+### Difficulty Score (1–100)
+
+Estimates how hard it would be to rank for a keyword by evaluating competition strength across factors like existing app ratings, market dominance, publisher diversity, and content relevance.
+
+**Tiers:** Very Easy (&lt;16) · Easy (16–35) · Moderate (36–55) · Hard (56–75) · Very Hard (76–90) · Extreme (91+)
+
+### Download Estimates
+
+Estimates daily downloads per ranking position based on search volume, expected tap-through rates by position, and install conversion rates. Results are shown as conservative–optimistic ranges with tier breakdowns for Top 5, Top 6–10, and Top 11–20.
+
+For full methodology details, visit the **Methodology** page inside the app or explore the [source code](https://github.com/respectlytics/respectaso).
+
+## Configuration
+
+<details>
+<summary><strong>Custom Local Domain (Docker only)</strong></summary>
+
+If running via Docker, you can use a cleaner URL. Add this to your `/etc/hosts` file:
+
+```bash
+sudo sh -c 'echo "127.0.0.1  respectaso.private" >> /etc/hosts'
+```
+
+Then access the tool at **[http://respectaso.private](http://respectaso.private)**
+
+The `.private` TLD is reserved by [RFC 6762](https://www.rfc-editor.org/rfc/rfc6762) and avoids conflicts with macOS mDNS resolution (unlike `.local`).
+
+</details>
 
 ## Tech Stack
 
 - **Python 3.14** + **Django 6.0**
+- **pywebview** — native macOS WebKit window
 - **SQLite** — local single-user database
-- **Gunicorn** — production WSGI server
+- **wsgiref** — built-in Python WSGI server
 - **WhiteNoise** — efficient static file serving
 - **OpenAI API (optional)** — AI keyword suggestion drafts
 - **Tailwind CSS** (CDN) — dark theme UI
-- **Docker** — single-command deployment
+- **PyInstaller** — macOS `.app` bundle
 
 ## Privacy
 
 RespectASO is designed with privacy as a core principle:
 
-- **100% local** — the tool runs entirely on your machine inside Docker
+- **100% local** — the tool runs entirely on your machine as a native app
 - **No accounts** — no registration, no login, no user tracking
 - **No telemetry** — zero analytics, zero phone-home, zero data collection
 - **No API keys required for core ASO** — the core keyword pipeline uses only Apple public APIs
@@ -280,7 +366,7 @@ See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
 
 ## Contact
 
-[respectlytics@loheden.com](mailto:respectlytics@loheden.com)
+[respectaso@loheden.com](mailto:respectaso@loheden.com)
 
 ---
 

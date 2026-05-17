@@ -2,6 +2,7 @@ Django>=6.0,<6.1
 gunicorn
 openai==2.11.0
 PyJWT[crypto]
+pywebview>=5.0,<6.0
 python-dotenv
 requests
 whitenoise

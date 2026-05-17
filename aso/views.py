@@ -7,6 +7,8 @@ import time
 import urllib.request
 from datetime import timedelta
 
+logger = logging.getLogger(__name__)
+
 from django.conf import settings
 from django.db import close_old_connections
 from django.http import HttpResponse, JsonResponse
@@ -52,11 +54,13 @@ from .copilot_ai_service import (
     reject_copilot_metadata_variant,
     reject_copilot_recommendation,
 )
+from .scoring import calc_opportunity, classify_keyword, CLASSIFICATION_LABELS
 from .services import (
     DifficultyCalculator,
     DownloadEstimator,
     ITunesSearchService,
     PopularityEstimator,
+    SearchAPIUnavailableError,
 )
 from .refresh_service import run_refresh
 
@@ -519,30 +523,60 @@ def dashboard_view(request):
     search_form = KeywordSearchForm()
 
     # --- History table (latest result per keyword+country) ---
-    app_id = request.GET.get("app")
+    app_id_raw = request.GET.get("app")
+    try:
+        selected_app_id = int(app_id_raw) if app_id_raw else None
+    except (TypeError, ValueError):
+        selected_app_id = None
     country_filter = request.GET.get("country", "")
-    sort_key = str(request.GET.get("sort", "date")).strip().lower()
+    sort_by = str(request.GET.get("sort", "date")).strip().lower()
     sort_dir = str(request.GET.get("dir", "desc")).strip().lower()
-    valid_sort_keys = {
+    valid_sort_fields = {
         "keyword",
         "rank",
         "popularity",
         "difficulty",
+        "opportunity",
+        "est_downloads",
+        "insight",
         "country",
         "competitors",
         "date",
     }
-    if sort_key not in valid_sort_keys:
-        sort_key = "date"
+    if sort_by not in valid_sort_fields:
+        sort_by = "date"
     if sort_dir not in {"asc", "desc"}:
         sort_dir = "desc"
 
+    selected_app_name = None
+    selected_app_obj = None
+    if selected_app_id:
+        selected_app_obj = App.objects.filter(id=selected_app_id).first()
+        if selected_app_obj:
+            selected_app_name = selected_app_obj.name
+
+    # --- Filter params (insight, popularity, difficulty) ---
+    insight_filter = request.GET.getlist("insight")
+    pop_min_param = request.GET.get("pop_min", "")
+    diff_max_param = request.GET.get("diff_max", "")
+    search_q = request.GET.get("q", "").strip()
+
+    try:
+        pop_min = int(pop_min_param) if pop_min_param else None
+    except (ValueError, TypeError):
+        pop_min = None
+    try:
+        diff_max = int(diff_max_param) if diff_max_param else None
+    except (ValueError, TypeError):
+        diff_max = None
+
     # Get the latest result ID for each keyword+country pair
-    from django.db.models import Max
+    from django.db.models import Case, IntegerField, Max, Value, When
+    from django.db.models.functions import Lower
 
     latest_filter = {}
-    if app_id:
-        latest_filter["keyword__app_id"] = app_id
+    if selected_app_id:
+        latest_filter["keyword__app_id"] = selected_app_id
     if country_filter:
         latest_filter["country"] = country_filter.lower()
 
@@ -556,8 +590,8 @@ def dashboard_view(request):
 
     # Distinct countries that have results (for the history country filter)
     country_base_filter = {}
-    if app_id:
-        country_base_filter["keyword__app_id"] = app_id
+    if selected_app_id:
+        country_base_filter["keyword__app_id"] = selected_app_id
     available_countries = (
         SearchResult.objects
         .filter(**country_base_filter)
@@ -567,51 +601,142 @@ def dashboard_view(request):
     )
     latest_ids = list(latest_ids_qs)
 
+    # Most recent refresh timestamp (respects app/country filters above).
+    # Surfaces the auto-refresh the scheduler runs in the background so users
+    # see "Rankings auto-refreshed X ago" without needing to click anything.
+    last_refresh = (
+        SearchResult.objects
+        .filter(**latest_filter)
+        .aggregate(latest=Max("searched_at"))["latest"]
+    )
+
     results_qs = (
         SearchResult.objects
         .filter(id__in=latest_ids)
         .select_related("keyword", "keyword__app")
     )
-    sorted_results = list(results_qs)
 
-    def _sort_results(rows):
-        if sort_key == "keyword":
-            rows.sort(key=lambda r: (r.keyword.keyword or "").lower(), reverse=(sort_dir == "desc"))
-        elif sort_key == "rank":
-            if sort_dir == "asc":
-                rows.sort(key=lambda r: (r.app_rank is None, r.app_rank if r.app_rank is not None else 10**9))
-            else:
-                rows.sort(key=lambda r: (r.app_rank is None, -(r.app_rank or 0)))
-        elif sort_key == "popularity":
-            if sort_dir == "asc":
-                rows.sort(
-                    key=lambda r: (
-                        r.popularity_score is None,
-                        r.popularity_score if r.popularity_score is not None else 10**9,
-                    )
-                )
-            else:
-                rows.sort(
-                    key=lambda r: (
-                        r.popularity_score is None,
-                        -(r.popularity_score or 0),
-                    )
-                )
-        elif sort_key == "difficulty":
-            rows.sort(key=lambda r: r.difficulty_score or 0, reverse=(sort_dir == "desc"))
-        elif sort_key == "country":
-            rows.sort(key=lambda r: (r.country or "").lower(), reverse=(sort_dir == "desc"))
-        elif sort_key == "competitors":
-            rows.sort(key=lambda r: len(r.competitors_data or []), reverse=(sort_dir == "desc"))
-        else:  # date
-            rows.sort(key=lambda r: r.searched_at or timezone.now(), reverse=(sort_dir == "desc"))
+    # Total unfiltered count (before insight/pop/diff filters)
+    total_unfiltered_count = results_qs.count()
 
-    _sort_results(sorted_results)
+    # Apply keyword text search
+    if search_q:
+        results_qs = results_qs.filter(keyword__keyword__icontains=search_q)
+
+    # Apply popularity / difficulty filters
+    if pop_min is not None:
+        results_qs = results_qs.filter(
+            popularity_score__isnull=False,
+            popularity_score__gte=pop_min,
+        )
+    if diff_max is not None:
+        results_qs = results_qs.filter(
+            difficulty_score__isnull=False,
+            difficulty_score__lte=diff_max,
+        )
+
+    # Apply insight filter using the stored classification column.
+    # classify_keyword() is the single source of truth — the column
+    # is set on save(), so a simple __in filter is always exact.
+    valid_insights = [i for i in insight_filter if i in CLASSIFICATION_LABELS]
+    if valid_insights:
+        results_qs = results_qs.filter(classification__in=valid_insights)
+
+    # Show rank when the current scope has rank data or trackable app rows.
+    has_rank_data = results_qs.filter(app_rank__isnull=False).exists()
+    if selected_app_obj:
+        show_rank = bool(selected_app_obj.track_id or has_rank_data)
+    else:
+        has_trackable_rows = results_qs.filter(keyword__app__track_id__isnull=False).exists()
+        show_rank = bool(has_trackable_rows or has_rank_data)
+
+    sorted_results = None
+
+    if sort_by == "keyword":
+        keyword_order = Lower("keyword__keyword")
+        results_qs = results_qs.order_by(
+            keyword_order.asc() if sort_dir == "asc" else keyword_order.desc(),
+            "-searched_at",
+        )
+    elif sort_by == "rank":
+        if show_rank:
+            rank_is_null = Case(
+                When(app_rank__isnull=True, then=Value(1)),
+                default=Value(0),
+                output_field=IntegerField(),
+            )
+            rank_order = "app_rank" if sort_dir == "asc" else "-app_rank"
+            results_qs = results_qs.order_by(rank_is_null, rank_order, "-searched_at")
+        else:
+            sort_by = "date"
+            sort_dir = "desc"
+            results_qs = results_qs.order_by("-searched_at")
+    elif sort_by == "popularity":
+        popularity_is_null = Case(
+            When(popularity_score__isnull=True, then=Value(1)),
+            default=Value(0),
+            output_field=IntegerField(),
+        )
+        popularity_order = "popularity_score" if sort_dir == "asc" else "-popularity_score"
+        results_qs = results_qs.order_by(popularity_is_null, popularity_order, "-searched_at")
+    elif sort_by == "difficulty":
+        difficulty_order = "difficulty_score" if sort_dir == "asc" else "-difficulty_score"
+        results_qs = results_qs.order_by(difficulty_order, "-searched_at")
+    elif sort_by == "opportunity":
+        sorted_results = list(results_qs)
+        reverse = sort_dir == "desc"
+        sorted_results.sort(
+            key=lambda r: (r.opportunity_score, r.searched_at.timestamp()),
+            reverse=reverse,
+        )
+    elif sort_by == "country":
+        country_order = "country" if sort_dir == "asc" else "-country"
+        results_qs = results_qs.order_by(country_order, "-searched_at")
+    elif sort_by == "insight":
+        insight_order = "classification" if sort_dir == "asc" else "-classification"
+        results_qs = results_qs.order_by(insight_order, "-searched_at")
+    elif sort_by == "est_downloads":
+        # download_estimates lives in the difficulty_breakdown JSONField, so
+        # sort in Python — same pattern as the opportunity/competitors branches.
+        # Per scoring-consistency.instructions.md: sort by positions[0].downloads_high
+        # (rank #1 high estimate), NEVER tier averages.
+        def _dl_high(result):
+            est = (result.difficulty_breakdown or {}).get("download_estimates") or {}
+            positions = est.get("positions") or []
+            if not positions:
+                return -1.0
+            try:
+                return float(positions[0].get("downloads_high", -1))
+            except (TypeError, ValueError):
+                return -1.0
+
+        sorted_results = list(results_qs)
+        reverse = sort_dir == "desc"
+        sorted_results.sort(
+            key=lambda r: (_dl_high(r), r.searched_at.timestamp()),
+            reverse=reverse,
+        )
+    elif sort_by == "competitors":
+        sorted_results = list(results_qs)
+        sorted_results.sort(
+            key=lambda result: (
+                len(result.competitors_data or []),
+                -result.searched_at.timestamp(),
+            )
+            if sort_dir == "asc"
+            else (
+                -len(result.competitors_data or []),
+                -result.searched_at.timestamp(),
+            )
+        )
+    else:
+        date_order = "searched_at" if sort_dir == "asc" else "-searched_at"
+        results_qs = results_qs.order_by(date_order)
 
     # Count unique keywords for the toolbar
     keyword_qs = Keyword.objects.all()
-    if app_id:
-        keyword_qs = keyword_qs.filter(app_id=app_id)
+    if selected_app_id:
+        keyword_qs = keyword_qs.filter(app_id=selected_app_id)
     keyword_count = keyword_qs.count()
 
     # Pagination (25 per page)
@@ -622,11 +747,14 @@ def dashboard_view(request):
         page = 1
 
     per_page = 25
-    total_count = len(sorted_results)
+    total_count = len(sorted_results) if sorted_results is not None else results_qs.count()
     total_pages = max(1, (total_count + per_page - 1) // per_page)
     page = min(page, total_pages)
     start = (page - 1) * per_page
-    history_results = sorted_results[start : start + per_page]
+    if sorted_results is not None:
+        history_results = sorted_results[start : start + per_page]
+    else:
+        history_results = list(results_qs[start : start + per_page])
 
     # Annotate each result with trend data (previous result comparison)
     for result in history_results:
@@ -666,29 +794,13 @@ def dashboard_view(request):
             result.difficulty_delta = None
             result.rank_delta = None
 
-    # Show rank column whenever rank can be meaningful in current scope.
-    show_rank = False
-    selected_app_name = None
-    has_rank_data = any(result.app_rank is not None for result in sorted_results)
-    has_trackable_rows = any(
-        bool(result.keyword.app and result.keyword.app.track_id)
-        for result in sorted_results
-    )
-    if app_id:
-        selected_app_obj = App.objects.filter(id=app_id).first()
-        if selected_app_obj:
-            selected_app_name = selected_app_obj.name
-            show_rank = bool(selected_app_obj.track_id or has_rank_data)
-    else:
-        show_rank = bool(has_trackable_rows or has_rank_data)
-
     base_params = request.GET.copy()
     if "page" in base_params:
         base_params.pop("page")
     sort_links = {}
-    for key in valid_sort_keys:
+    for key in valid_sort_fields:
         params = base_params.copy()
-        next_dir = "desc" if (sort_key == key and sort_dir == "asc") else "asc"
+        next_dir = "desc" if (sort_by == key and sort_dir == "asc") else "asc"
         params["sort"] = key
         params["dir"] = next_dir
         sort_links[key] = params.urlencode()
@@ -704,6 +816,9 @@ def dashboard_view(request):
         next_params["page"] = page + 1
         next_query = next_params.urlencode()
 
+    # Determine if any filters are active
+    has_filters = bool(valid_insights or pop_min is not None or diff_max is not None or search_q)
+
     return render(
         request,
         "aso/dashboard.html",
@@ -713,7 +828,7 @@ def dashboard_view(request):
             # History table context
             "history_results": history_results,
             "keyword_count": keyword_count,
-            "selected_app": int(app_id) if app_id else None,
+            "selected_app": selected_app_id,
             "selected_app_name": selected_app_name,
             "selected_country": country_filter,
             "available_countries": list(available_countries),
@@ -721,13 +836,22 @@ def dashboard_view(request):
             "page": page,
             "total_pages": total_pages,
             "total_count": total_count,
+            "total_unfiltered_count": total_unfiltered_count,
+            "last_refresh": last_refresh,
             "has_prev": page > 1,
             "has_next": page < total_pages,
-            "current_sort": sort_key,
+            "current_sort": sort_by,
             "current_sort_dir": sort_dir,
             "sort_links": sort_links,
             "prev_query": prev_query,
             "next_query": next_query,
+            "current_dir": sort_dir,
+            # Filter state
+            "selected_insights": valid_insights,
+            "selected_pop_min": pop_min,
+            "selected_diff_max": diff_max,
+            "search_q": search_q,
+            "has_filters": has_filters,
         },
     )
 
@@ -781,11 +905,6 @@ def search_view(request):
     for country in countries:
         country_results = []
         for kw_text in keywords:
-            # Rate limit between API calls
-            if call_count > 0:
-                time.sleep(2)
-            call_count += 1
-
             # Get or create keyword
             keyword_obj, created = Keyword.objects.get_or_create(
                 keyword=kw_text.lower(),
@@ -800,8 +919,19 @@ def search_view(request):
                 skipped.append(f"{kw_text} ({country.upper()})")
                 continue
 
-            # iTunes Search
-            competitors = itunes_service.search_apps(kw_text, country=country, limit=25)
+            # Rate limit between external API calls only.
+            if call_count > 0:
+                time.sleep(2)
+            call_count += 1
+
+            # Search for competitors
+            try:
+                competitors = itunes_service.search_apps(kw_text, country=country, limit=25)
+            except SearchAPIUnavailableError as e:
+                return JsonResponse(
+                    {"error": str(e)},
+                    status=503,
+                )
 
             # Difficulty Score
             difficulty_score, breakdown = difficulty_calc.calculate(
@@ -811,15 +941,21 @@ def search_view(request):
             # Find user's app rank (if app has a track_id)
             app_rank = None
             if app and app.track_id:
-                app_rank = itunes_service.find_app_rank(
-                    kw_text, app.track_id, country=country
-                )
+                try:
+                    app_rank = itunes_service.find_app_rank(
+                        kw_text, app.track_id, country=country
+                    )
+                except SearchAPIUnavailableError:
+                    pass  # Rank is optional — continue without it
 
             # Popularity (estimated from competitor data)
             popularity = popularity_est.estimate(competitors, kw_text)
 
             # Download estimates
-            download_estimates = download_est.estimate(popularity or 0, len(competitors))
+            download_estimates = download_est.estimate(
+                popularity or 0,
+                country=country,
+            )
             breakdown["download_estimates"] = download_estimates
 
             # Save result (one entry per keyword+country per day)
@@ -833,12 +969,15 @@ def search_view(request):
                 country=country,
             )
 
+            opportunity = calc_opportunity(popularity or 0, difficulty_score)
+
             country_results.append(
                 {
                     "keyword": kw_text,
                     "country": country,
                     "popularity_score": popularity,
                     "difficulty_score": difficulty_score,
+                    "opportunity_score": opportunity,
                     "difficulty_label": search_result.difficulty_label,
                     "difficulty_color": search_result.difficulty_color,
                     "difficulty_breakdown": breakdown,
@@ -847,6 +986,7 @@ def search_view(request):
                     "app_rank": app_rank,
                     "app_name": app.name if app else None,
                     "app_icon": app.icon_url if app else None,
+                    "classification": search_result.classification,
                 }
             )
         results_by_country[country] = country_results
@@ -863,7 +1003,7 @@ def search_view(request):
                     kw_map[kw] = {}
                 pop = r["popularity_score"] or 0
                 diff = r["difficulty_score"]
-                opp = round(pop * (100 - diff) / 100)
+                opp = calc_opportunity(pop, diff)
                 kw_map[kw][country] = {
                     "popularity": pop,
                     "difficulty": diff,
@@ -902,6 +1042,86 @@ def opportunity_view(request):
 
 
 @require_POST
+def opportunity_search_country_view(request):
+    """AJAX endpoint: search a keyword in a single country.
+
+    Called once per country by the frontend (30 sequential calls).
+    """
+    keyword = request.POST.get("keyword", "").strip().lower()
+    country_code = request.POST.get("country", "").strip().lower()
+    app_id = request.POST.get("app_id", "")
+
+    valid_codes = {code for code, _ in COUNTRY_CHOICES}
+    if not keyword or country_code not in valid_codes:
+        return JsonResponse({"error": "Missing or invalid keyword/country."}, status=400)
+
+    app = None
+    if app_id:
+        try:
+            app = App.objects.get(id=app_id)
+        except App.DoesNotExist:
+            pass
+
+    itunes_service = ITunesSearchService()
+    difficulty_calc = DifficultyCalculator()
+    popularity_est = PopularityEstimator()
+    download_est = DownloadEstimator()
+
+    try:
+        competitors = itunes_service.search_apps(keyword, country=country_code, limit=25)
+    except SearchAPIUnavailableError as e:
+        return JsonResponse({"error": str(e)}, status=503)
+
+    difficulty_score, breakdown = difficulty_calc.calculate(
+        competitors, keyword=keyword
+    )
+    popularity = popularity_est.estimate(competitors, keyword)
+
+    download_estimates = download_est.estimate(popularity or 0, country=country_code)
+    breakdown["download_estimates"] = download_estimates
+
+    app_rank = None
+    if app and app.track_id:
+        try:
+            app_rank = itunes_service.find_app_rank(
+                keyword, app.track_id, country=country_code
+            )
+        except SearchAPIUnavailableError:
+            pass  # Rank is optional
+
+    if difficulty_score <= 15:
+        diff_label = "Very Easy"
+    elif difficulty_score <= 35:
+        diff_label = "Easy"
+    elif difficulty_score <= 55:
+        diff_label = "Moderate"
+    elif difficulty_score <= 75:
+        diff_label = "Hard"
+    elif difficulty_score <= 90:
+        diff_label = "Very Hard"
+    else:
+        diff_label = "Extreme"
+
+    opportunity = calc_opportunity(popularity, difficulty_score)
+    top_competitor = competitors[0]["trackName"] if competitors else "—"
+    top_ratings = competitors[0].get("userRatingCount", 0) if competitors else 0
+
+    return JsonResponse({
+        "country": country_code,
+        "popularity": popularity,
+        "difficulty": difficulty_score,
+        "difficulty_label": diff_label,
+        "difficulty_breakdown": breakdown,
+        "competitors_data": competitors,
+        "opportunity": opportunity,
+        "app_rank": app_rank,
+        "competitor_count": len(competitors),
+        "top_competitor": top_competitor,
+        "top_ratings": top_ratings,
+    })
+
+
+@require_POST
 def opportunity_search_view(request):
     """
     AJAX endpoint: search a single keyword across all 30 countries.
@@ -931,24 +1151,36 @@ def opportunity_search_view(request):
     download_est = DownloadEstimator()
 
     results = []
+    errors = []
     for i, (country_code, country_name) in enumerate(COUNTRY_CHOICES):
         if i > 0:
             time.sleep(2)
 
-        competitors = itunes_service.search_apps(kw_text, country=country_code, limit=25)
+        try:
+            competitors = itunes_service.search_apps(kw_text, country=country_code, limit=25)
+        except SearchAPIUnavailableError as e:
+            errors.append({"country": country_code, "error": str(e)})
+            continue
+
         difficulty_score, breakdown = difficulty_calc.calculate(
             competitors, keyword=kw_text
         )
         popularity = popularity_est.estimate(competitors, kw_text)
 
-        download_estimates = download_est.estimate(popularity or 0, len(competitors))
+        download_estimates = download_est.estimate(
+            popularity or 0,
+            country=country_code,
+        )
         breakdown["download_estimates"] = download_estimates
 
         app_rank = None
         if app and app.track_id:
-            app_rank = itunes_service.find_app_rank(
-                kw_text, app.track_id, country=country_code
-            )
+            try:
+                app_rank = itunes_service.find_app_rank(
+                    kw_text, app.track_id, country=country_code
+                )
+            except SearchAPIUnavailableError:
+                pass  # Rank is optional
 
         # Compute difficulty label from score (same logic as model property)
         if difficulty_score <= 15:
@@ -964,7 +1196,7 @@ def opportunity_search_view(request):
         else:
             diff_label = "Extreme"
 
-        opportunity = round(popularity * (100 - difficulty_score) / 100) if popularity else 0
+        opportunity = calc_opportunity(popularity, difficulty_score)
         top_competitor = competitors[0]["trackName"] if competitors else "—"
         top_ratings = competitors[0].get("userRatingCount", 0) if competitors else 0
 
@@ -980,16 +1212,21 @@ def opportunity_search_view(request):
             "competitor_count": len(competitors),
             "top_competitor": top_competitor,
             "top_ratings": top_ratings,
+            "classification": classify_keyword(popularity or 0, difficulty_score),
         })
 
     results.sort(key=lambda x: x["opportunity"], reverse=True)
 
-    return JsonResponse({
+    response_data = {
         "keyword": kw_text,
         "app_id": app.id if app else None,
         "results": results,
         "total_countries": len(results),
-    })
+    }
+    if errors:
+        response_data["errors"] = errors
+        response_data["error_count"] = len(errors)
+    return JsonResponse(response_data)
 
 
 @require_POST
@@ -1059,7 +1296,12 @@ def app_lookup_view(request):
     url_match = re.search(r"/id(\d+)", query)
     if url_match:
         track_id = int(url_match.group(1))
-        app_data = itunes_service.lookup_by_id(track_id)
+        # Extract country code from URL (e.g. apps.apple.com/de/app/...)
+        country_match = re.search(
+            r"apps\.apple\.com/([a-z]{2})/", query, re.IGNORECASE
+        )
+        country = country_match.group(1).lower() if country_match else "us"
+        app_data = itunes_service.lookup_by_id(track_id, country=country)
         if app_data:
             return JsonResponse(
                 {
@@ -1077,7 +1319,12 @@ def app_lookup_view(request):
         return JsonResponse({"apps": []})
 
     # Otherwise search by name
-    results = itunes_service.search_apps(query, limit=5)
+    try:
+        results = itunes_service.search_apps(query, limit=5)
+    except SearchAPIUnavailableError:
+        return JsonResponse(
+            {"apps": [], "error": "App Store search is temporarily unavailable."}
+        )
     return JsonResponse(
         {
             "apps": [
@@ -1220,10 +1467,13 @@ def keyword_refresh_view(request, keyword_id):
     popularity_est = PopularityEstimator()
     download_est = DownloadEstimator()
 
-    # Search iTunes
-    competitors = itunes_service.search_apps(
-        keyword_obj.keyword, country=country, limit=25
-    )
+    # Search for competitors
+    try:
+        competitors = itunes_service.search_apps(
+            keyword_obj.keyword, country=country, limit=25
+        )
+    except SearchAPIUnavailableError as e:
+        return JsonResponse({"error": str(e)}, status=503)
 
     # Calculate difficulty
     difficulty_score, breakdown = difficulty_calc.calculate(
@@ -1234,15 +1484,21 @@ def keyword_refresh_view(request, keyword_id):
     app_rank = None
     app = keyword_obj.app
     if app and app.track_id:
-        app_rank = itunes_service.find_app_rank(
-            keyword_obj.keyword, app.track_id, country=country
-        )
+        try:
+            app_rank = itunes_service.find_app_rank(
+                keyword_obj.keyword, app.track_id, country=country
+            )
+        except SearchAPIUnavailableError:
+            pass  # Rank is optional
 
     # Popularity (estimated from competitor data)
     popularity = popularity_est.estimate(competitors, keyword_obj.keyword)
 
     # Download estimates
-    download_estimates = download_est.estimate(popularity or 0, len(competitors))
+    download_estimates = download_est.estimate(
+        popularity or 0,
+        country=country,
+    )
     breakdown["download_estimates"] = download_estimates
 
     search_result = SearchResult.create_snapshot(
@@ -1276,45 +1532,138 @@ def keyword_refresh_view(request, keyword_id):
 
 def export_history_csv_view(request):
     """
-    Export all search history as a CSV file.
+    Export search history as a CSV file.
 
-    Supports optional ?app= filter to limit to one app.
+    Supports the same filters as the dashboard: app, country, insight,
+    pop_min, diff_max.  Only the latest result per keyword+country is
+    exported (matching the dashboard table).
     """
     app_id = request.GET.get("app")
     country = request.GET.get("country")
-    results_qs = SearchResult.objects.select_related("keyword", "keyword__app").order_by(
-        "-searched_at"
-    )
+    insight_filter = request.GET.getlist("insight")
+    pop_min_raw = request.GET.get("pop_min")
+    diff_max_raw = request.GET.get("diff_max")
+    search_q = request.GET.get("q", "").strip()
+
+    pop_min = int(pop_min_raw) if pop_min_raw and pop_min_raw.isdigit() else None
+    diff_max = int(diff_max_raw) if diff_max_raw and diff_max_raw.isdigit() else None
+
+    from django.db.models import Max
+
+    # Deduplicate: keep only the latest result per keyword+country
+    latest_filter = {}
     if app_id:
-        results_qs = results_qs.filter(keyword__app_id=app_id)
+        latest_filter["keyword__app_id"] = app_id
     if country:
-        results_qs = results_qs.filter(country=country.lower())
+        latest_filter["country"] = country.lower()
+
+    latest_ids = list(
+        SearchResult.objects
+        .filter(**latest_filter)
+        .values("keyword_id", "country")
+        .annotate(latest_id=Max("id"))
+        .values_list("latest_id", flat=True)
+    )
+
+    results_qs = (
+        SearchResult.objects
+        .filter(id__in=latest_ids)
+        .select_related("keyword", "keyword__app")
+    )
+
+    # Apply keyword text search
+    if search_q:
+        results_qs = results_qs.filter(keyword__keyword__icontains=search_q)
+
+    # Apply popularity / difficulty filters
+    if pop_min is not None:
+        results_qs = results_qs.filter(
+            popularity_score__isnull=False,
+            popularity_score__gte=pop_min,
+        )
+    if diff_max is not None:
+        results_qs = results_qs.filter(
+            difficulty_score__isnull=False,
+            difficulty_score__lte=diff_max,
+        )
+
+    # Apply insight filter using stored classification column
+    valid_insights = [i for i in insight_filter if i in CLASSIFICATION_LABELS]
+    if valid_insights:
+        results_qs = results_qs.filter(classification__in=valid_insights)
+
+    results_qs = results_qs.order_by("-searched_at")
+
+    # Determine export mode: summary (default) or with competitor apps
+    include_apps = request.GET.get("include_apps", "").strip().lower()
+    apps_limit = {"top5": 5, "top10": 10}.get(include_apps, 0)
+
+    if apps_limit:
+        filename = "respectaso-search-history-with-apps.csv"
+    else:
+        filename = "respectaso-search-history.csv"
 
     response = HttpResponse(content_type="text/csv")
-    response["Content-Disposition"] = 'attachment; filename="respectaso-search-history.csv"'
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
 
     writer = csv.writer(response)
-    writer.writerow([
+
+    base_columns = [
         "Keyword", "App", "Country", "Popularity", "Difficulty",
-        "Difficulty Label", "Rank", "Competitors", "Date",
-    ])
+        "Difficulty Label", "Opportunity", "Insight", "Rank",
+        "Competitors", "Date",
+    ]
+    app_columns = [
+        "Competitor Position", "Competitor App", "Competitor Seller",
+        "Competitor Rating", "Competitor Ratings Count",
+        "Competitor Genre", "Competitor Price",
+        "Competitor App Store URL",
+    ]
+    writer.writerow(base_columns + app_columns if apps_limit else base_columns)
 
     for r in results_qs:
-        writer.writerow([
+        pop = r.popularity_score if r.popularity_score is not None else ""
+        opportunity = (
+            calc_opportunity(r.popularity_score, r.difficulty_score)
+            if r.popularity_score is not None
+            else ""
+        )
+        base_row = [
             r.keyword.keyword,
             r.keyword.app.name if r.keyword.app else "",
             r.country.upper() if r.country else "",
-            r.popularity_score if r.popularity_score is not None else "",
+            pop,
             r.difficulty_score,
             r.difficulty_label,
+            opportunity,
+            r.classification,
             r.app_rank if r.app_rank else "",
             len(r.competitors_data) if r.competitors_data else 0,
             r.searched_at.strftime("%Y-%m-%d %H:%M") if r.searched_at else "",
-        ])
+        ]
+
+        if not apps_limit:
+            writer.writerow(base_row)
+        else:
+            competitors = (r.competitors_data or [])[:apps_limit]
+            if not competitors:
+                writer.writerow(base_row + [""] * len(app_columns))
+            else:
+                for idx, comp in enumerate(competitors, 1):
+                    writer.writerow(base_row + [
+                        idx,
+                        comp.get("trackName", ""),
+                        comp.get("sellerName", ""),
+                        comp.get("averageUserRating", ""),
+                        comp.get("userRatingCount", ""),
+                        comp.get("primaryGenreName", ""),
+                        comp.get("formattedPrice", ""),
+                        comp.get("trackViewUrl", ""),
+                    ])
 
     # Respectlytics attribution row
     writer.writerow([])
-    writer.writerow(["Privacy-first mobile analytics — https://respectlytics.com"])
+    writer.writerow(["Privacy-first mobile analytics - https://respectlytics.com"])
 
     return response
 
@@ -1324,8 +1673,11 @@ def keywords_bulk_refresh_view(request):
     """
     Start an async refresh for in-scope tracked keyword-country pairs.
 
-    POST body: {"app_id": int|null}
-    Returns quickly with run metadata while work continues in a background thread.
+    POST body: {"app_id": int|null, "country": str|""}
+      - app_id=null  → all keywords (every app + unassigned)
+      - app_id=<int> → only keywords linked to that app
+      - country=""   → all countries
+      - country="fr"  → only that country
     """
     try:
         body = json.loads(request.body or "{}")
@@ -1340,6 +1692,10 @@ def keywords_bulk_refresh_view(request):
             app_id = int(app_id)
         except (TypeError, ValueError):
             return JsonResponse({"success": False, "error": "Invalid app_id."}, status=400)
+
+    country = str(body.get("country") or "").strip().lower()
+    if country and country not in {code for code, _ in COUNTRY_CHOICES}:
+        return JsonResponse({"success": False, "error": "Invalid country."}, status=400)
 
     now = timezone.now()
     stale_cutoff = now - timedelta(hours=BULK_REFRESH_STALE_HOURS)
@@ -1367,20 +1723,24 @@ def keywords_bulk_refresh_view(request):
         keywords_qs = keywords_qs.filter(app_id=app_id)
     keyword_ids = list(keywords_qs.values_list("id", flat=True))
     if not keyword_ids:
-        return JsonResponse({"success": True, "started": False, "total_pairs": 0})
+        return JsonResponse({"success": True, "started": False, "total_pairs": 0, "total": 0})
 
+    base_qs = SearchResult.objects.filter(keyword_id__in=keyword_ids)
+    if country:
+        base_qs = base_qs.filter(country=country)
     pairs = list(
-        SearchResult.objects.filter(keyword_id__in=keyword_ids)
+        base_qs
         .values_list("keyword_id", "country")
         .distinct()
         .order_by("keyword_id", "country")
     )
-    seen_keyword_ids = {keyword_id for keyword_id, _ in pairs}
-    pairs.extend((keyword_id, "us") for keyword_id in keyword_ids if keyword_id not in seen_keyword_ids)
-    pairs = sorted((int(keyword_id), str(country or "us").lower()) for keyword_id, country in pairs)
+    if not country:
+        seen_keyword_ids = {keyword_id for keyword_id, _ in pairs}
+        pairs.extend((keyword_id, "us") for keyword_id in keyword_ids if keyword_id not in seen_keyword_ids)
+    pairs = sorted({(int(keyword_id), str(pair_country or "us").lower()) for keyword_id, pair_country in pairs})
 
     if not pairs:
-        return JsonResponse({"success": True, "started": False, "total_pairs": 0})
+        return JsonResponse({"success": True, "started": False, "total_pairs": 0, "total": 0})
 
     run = RefreshRun.objects.create(
         trigger=RefreshRun.TRIGGER_MANUAL,
@@ -1405,6 +1765,7 @@ def keywords_bulk_refresh_view(request):
             "started": True,
             "run_id": run.id,
             "total_pairs": len(pairs),
+            "total": len(pairs),
         }
     )
 
@@ -2125,6 +2486,7 @@ def ai_copilot_metadata_reject_view(request, variant_id):
 def version_check_view(request):
     """Check GitHub for a newer release. Returns JSON with update info."""
     current = settings.VERSION
+    is_native = getattr(settings, "IS_NATIVE_APP", False)
     try:
         url = "https://api.github.com/repos/respectlytics/respectaso/releases/latest"
         req = urllib.request.Request(url, headers={"Accept": "application/vnd.github.v3+json"})
@@ -2132,25 +2494,62 @@ def version_check_view(request):
             data = json.loads(resp.read().decode())
         latest = data.get("tag_name", "").lstrip("v")
         if not latest:
-            return JsonResponse({"update_available": False, "current": current})
+            return JsonResponse({"update_available": False, "current": current, "is_native": is_native})
         # Simple semver comparison
         current_parts = [int(x) for x in current.split(".")]
         latest_parts = [int(x) for x in latest.split(".")]
         update_available = latest_parts > current_parts
+        # Extract .dmg download URL from release assets
+        download_url = ""
+        for asset in data.get("assets", []):
+            if asset.get("name", "").endswith(".dmg"):
+                download_url = asset.get("browser_download_url", "")
+                break
         return JsonResponse({
             "update_available": update_available,
             "current": current,
             "latest": latest,
             "release_url": data.get("html_url", ""),
+            "release_notes": data.get("body", ""),
+            "download_url": download_url,
+            "is_native": is_native,
         })
-    except Exception:
-        # Network error, GitHub down, etc. — silently fail
-        return JsonResponse({"update_available": False, "current": current})
+    except Exception as e:
+        logger.warning("Update check failed: %s: %s", type(e).__name__, e)
+        return JsonResponse({"update_available": False, "error": type(e).__name__, "current": current, "is_native": is_native})
 
 
 def auto_refresh_status_view(request):
     """Return the current auto-refresh progress as JSON."""
     return JsonResponse(RefreshRun.latest_status_payload())
+
+
+_dmg_url_cache = {"url": None, "expires": 0}
+
+GITHUB_RELEASES_URL = "https://github.com/respectlytics/respectaso/releases/latest"
+GITHUB_API_LATEST = "https://api.github.com/repos/respectlytics/respectaso/releases/latest"
+
+
+def download_dmg_view(request):
+    """Redirect to the latest .dmg download URL (direct file, no GitHub page)."""
+    now = time.time()
+    if _dmg_url_cache["url"] and now < _dmg_url_cache["expires"]:
+        return redirect(_dmg_url_cache["url"])
+
+    try:
+        req = urllib.request.Request(GITHUB_API_LATEST, headers={"Accept": "application/vnd.github.v3+json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        for asset in data.get("assets", []):
+            if asset.get("name", "").endswith(".dmg"):
+                url = asset["browser_download_url"]
+                _dmg_url_cache["url"] = url
+                _dmg_url_cache["expires"] = now + 300
+                return redirect(url)
+    except Exception:
+        logger.warning("Failed to fetch latest DMG URL from GitHub API")
+
+    return redirect(_dmg_url_cache.get("url") or GITHUB_RELEASES_URL)
 
 
 def keyword_trend_view(request, keyword_id):
@@ -2185,3 +2584,18 @@ def keyword_trend_view(request, keyword_id):
         "app_name": keyword_obj.app.name if keyword_obj.app else None,
         "data_points": data_points,
     })
+
+
+def pro_promo_researcher_view(request):
+    """Promotional page for AI Niche Researcher (free version)."""
+    return render(request, "aso/pro_promo/ai_researcher.html")
+
+
+def pro_promo_competitor_view(request):
+    """Promotional page for AI Competitor Analyzer (free version)."""
+    return render(request, "aso/pro_promo/ai_competitor.html")
+
+
+def pro_promo_simulator_view(request):
+    """Promotional page for ASO Score Simulator (free version)."""
+    return render(request, "aso/pro_promo/simulator.html")

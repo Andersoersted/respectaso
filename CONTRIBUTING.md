@@ -11,7 +11,7 @@ Thank you for your interest in contributing to RespectASO! We welcome contributi
    - Clear title and description
    - Steps to reproduce
    - Expected vs actual behavior
-   - Environment details (OS, Docker version, browser)
+   - Environment details (OS, app version, installation method)
 
 ### Suggesting Features
 
@@ -70,12 +70,23 @@ The CLA preserves our ability to offer dual licensing (AGPL-3.0 for open source,
 git clone https://github.com/YOUR-USERNAME/respectaso.git
 cd respectaso
 
-# Start with Docker
-docker compose up --build
+# Install dependencies
+pip install -r requirements.txt
 
+# Run migrations and start the dev server
+python manage.py migrate
+python manage.py runserver
+
+# Access at http://localhost:8000
+```
+
+Alternatively, use Docker:
+
+```bash
+docker compose up --build
 # Access at http://localhost
 ```
 
 ## Questions?
 
-Email: [respectlytics@loheden.com](mailto:respectlytics@loheden.com)
+Email: [respectaso@loheden.com](mailto:respectaso@loheden.com)
